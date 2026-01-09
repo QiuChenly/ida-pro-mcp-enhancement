@@ -1,3 +1,12 @@
+"""IDALib MCP服务器 - Headless模式
+
+支持多实例模式:
+- 使用 --coordinator 参数指定协调服务器地址
+- 启动时自动向协调服务器注册
+- 关闭时自动注销
+"""
+
+import os
 import sys
 import signal
 import logging
@@ -9,8 +18,6 @@ import idapro
 import ida_auto
 
 from ida_pro_mcp.ida_mcp import MCP_SERVER
-"""IDALib-specific MCP tools for managing multiple binary sessions
-"""
 from typing import Annotated, Optional
 from ida_pro_mcp.ida_mcp.rpc import tool
 from ida_pro_mcp.idalib_session_manager import get_session_manager
@@ -166,6 +173,8 @@ def idalib_switch(
                 "session": session.to_dict(),
                 "message": f"Switched to session: {session_id} ({session.input_path.name})"
             }
+        else:
+            return {"error": f"Failed to switch to session: {session_id}"}
     except ValueError as e:
         return {"error": str(e)}
     except RuntimeError as e:
@@ -278,6 +287,61 @@ def idalib_current() -> dict:
 
 logger = logging.getLogger(__name__)
 
+# 协调服务器注册状态
+_coordinator_instance_id: Optional[str] = None
+
+
+def _generate_instance_id(port: int) -> str:
+    """生成实例ID"""
+    return f"idalib-{port}-{os.getpid()}"
+
+
+def _register_to_coordinator(host: str, port: int, binary_path: str = "") -> bool:
+    """向协调服务器注册此实例（固定端口127.0.0.1:8801）"""
+    global _coordinator_instance_id
+    
+    try:
+        from ida_pro_mcp.ida_mcp.api_instances import register_to_coordinator
+        
+        _coordinator_instance_id = _generate_instance_id(port)
+        
+        result = register_to_coordinator(
+            instance_id=_coordinator_instance_id,
+            instance_type="headless",
+            port=port,
+            host=host,
+            name=os.path.basename(binary_path) if binary_path else f"idalib:{port}",
+            binary_path=binary_path,
+        )
+        
+        if result.get("success"):
+            logger.info(f"多实例模式: 已注册到协调服务器 (127.0.0.1:8801)")
+            return True
+        else:
+            _coordinator_instance_id = None
+            logger.info("单实例模式: 协调服务器未运行 (如需多实例，请先运行 ida-mcp-coordinator)")
+            return False
+    except Exception:
+        _coordinator_instance_id = None
+        logger.info("单实例模式: 协调服务器未运行 (如需多实例，请先运行 ida-mcp-coordinator)")
+        return False
+
+
+def _unregister_from_coordinator():
+    """从协调服务器注销"""
+    global _coordinator_instance_id
+    
+    if _coordinator_instance_id is None:
+        return
+    
+    try:
+        from ida_pro_mcp.ida_mcp.api_instances import unregister_from_coordinator
+        unregister_from_coordinator()
+        logger.info(f"已从协调服务器注销: {_coordinator_instance_id}")
+        _coordinator_instance_id = None
+    except Exception as e:
+        logger.warning(f"注销时出错: {e}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="MCP server for IDA Pro via idalib")
@@ -321,6 +385,8 @@ def main():
     from ida_pro_mcp.idalib_session_manager import get_session_manager
     session_manager = get_session_manager()
 
+    binary_path_str = ""
+
     # Open initial binary if provided
     if args.input_path is not None:
         if not args.input_path.exists():
@@ -329,14 +395,22 @@ def main():
         logger.info("opening initial database: %s", args.input_path)
         session_id = session_manager.open_binary(args.input_path, run_auto_analysis=True)
         logger.info(f"Initial session created: {session_id}")
+        binary_path_str = str(args.input_path)
     else:
         logger.info("No initial binary specified. Use idalib_open() to load binaries dynamically.")
+
+    # 尝试注册到协调服务器（固定端口127.0.0.1:8801，如果在线）
+    _register_to_coordinator(args.host, args.port, binary_path_str)
 
     # Setup signal handlers to ensure IDA database is properly closed on shutdown.
     # When a signal arrives, our handlers execute first, allowing us to close the
     # IDA database cleanly before the process terminates.
     def cleanup_and_exit(signum, frame):
         logger.info("Shutting down...")
+        
+        # 先注销
+        _unregister_from_coordinator()
+        
         logger.info("Closing all IDA sessions...")
         session_manager.close_all_sessions()
         logger.info("All sessions closed.")
@@ -348,6 +422,8 @@ def main():
     # NOTE: npx -y @modelcontextprotocol/inspector for debugging
     # TODO: with background=True the main thread (this one) does not fake any
     # work from @idasync, so we deadlock.
+    logger.info(f"MCP服务启动: http://{args.host}:{args.port}/mcp")
+    
     MCP_SERVER.serve(host=args.host, port=args.port, background=False)
 
 

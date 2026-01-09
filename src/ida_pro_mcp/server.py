@@ -22,26 +22,86 @@ else:
 
     sys.path.pop(0)  # Clean up
 
+
+# ============================================================================
+# 连接配置
+# ============================================================================
+
+# 协调服务器配置（多实例模式）
+COORDINATOR_HOST = "127.0.0.1"
+COORDINATOR_PORT = 8801   # 统一端口：管理API + MCP服务
+
+# 单实例IDA直连配置
 IDA_HOST = "127.0.0.1"
 IDA_PORT = 13337
+
+# 运行时状态（启动时确定）
+MULTI_INSTANCE_MODE = False   # 是否为多实例模式
+TARGET_HOST = IDA_HOST        # 实际连接目标
+TARGET_PORT = IDA_PORT        # 实际连接端口
+
+
+# ============================================================================
+# 协调服务器检测
+# ============================================================================
+
+def _check_coordinator_available() -> bool:
+    """检测协调服务器是否可用"""
+    try:
+        conn = http.client.HTTPConnection(COORDINATOR_HOST, COORDINATOR_PORT, timeout=2)
+        conn.request("GET", "/api/instances")
+        response = conn.getresponse()
+        data = response.read()
+        conn.close()
+        # 只要能连接并获取响应就算可用
+        return response.status == 200
+    except Exception:
+        return False
+
+
+def _init_connection_mode():
+    """初始化连接模式（在模块加载时调用）"""
+    global MULTI_INSTANCE_MODE, TARGET_HOST, TARGET_PORT
+    
+    if _check_coordinator_available():
+        MULTI_INSTANCE_MODE = True
+        TARGET_HOST = COORDINATOR_HOST
+        TARGET_PORT = COORDINATOR_PORT
+        print(f"[MCP] 多实例模式: 连接到协调服务器 ({COORDINATOR_HOST}:{COORDINATOR_PORT})")
+    else:
+        MULTI_INSTANCE_MODE = False
+        TARGET_HOST = IDA_HOST
+        TARGET_PORT = IDA_PORT
+        print(f"[MCP] 单实例模式: 直连IDA ({IDA_HOST}:{IDA_PORT})")
+
+
+# 模块加载时初始化连接模式
+_init_connection_mode()
+
+
+# ============================================================================
+# MCP服务器
+# ============================================================================
 
 mcp = McpServer("ida-pro-mcp")
 dispatch_original = mcp.registry.dispatch
 
 
-def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
-    """Dispatch JSON-RPC requests to the MCP server registry"""
-    if not isinstance(request, dict):
-        request_obj: JsonRpcRequest = json.loads(request)
-    else:
-        request_obj: JsonRpcRequest = request  # type: ignore
+# ============================================================================
+# 多实例模式说明
+# ============================================================================
+# 多实例模式下，所有请求（包括实例管理工具）都转发到协调服务器
+# 协调服务器负责提供 instance_list, instance_switch, instance_current 等工具
+# server.py 不再重复注册这些工具
 
-    if request_obj["method"] == "initialize":
-        return dispatch_original(request)
-    elif request_obj["method"].startswith("notifications/"):
-        return dispatch_original(request)
 
-    conn = http.client.HTTPConnection(IDA_HOST, IDA_PORT, timeout=30)
+# ============================================================================
+# 请求转发
+# ============================================================================
+
+def _forward_request(request: dict | str | bytes | bytearray, request_obj: "JsonRpcRequest") -> JsonRpcResponse | None:
+    """将请求转发到目标服务器（协调服务器或IDA）"""
+    conn = http.client.HTTPConnection(TARGET_HOST, TARGET_PORT, timeout=30)
     try:
         if isinstance(request, dict):
             request = json.dumps(request)
@@ -53,27 +113,54 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
         return json.loads(data)
     except Exception as e:
         full_info = traceback.format_exc()
-        id = request_obj.get("id")
-        if id is None:
+        req_id = request_obj.get("id")
+        if req_id is None:
             return None  # Notification, no response needed
 
-        if sys.platform == "darwin":
-            shortcut = "Ctrl+Option+M"
+        if MULTI_INSTANCE_MODE:
+            error_msg = f"连接协调服务器失败 ({TARGET_HOST}:{TARGET_PORT}): {e}"
         else:
-            shortcut = "Ctrl+Alt+M"
+            if sys.platform == "darwin":
+                shortcut = "Ctrl+Option+M"
+            else:
+                shortcut = "Ctrl+Alt+M"
+            error_msg = f"Failed to connect to IDA Pro! Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?\n{full_info}"
+        
         return JsonRpcResponse(
             {
                 "jsonrpc": "2.0",
                 "error": {
                     "code": -32000,
-                    "message": f"Failed to connect to IDA Pro! Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?\n{full_info}",
+                    "message": error_msg,
                     "data": str(e),
                 },
-                "id": id,
+                "id": req_id,
             }
         )
     finally:
         conn.close()
+
+
+def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
+    """Dispatch JSON-RPC requests to the MCP server registry"""
+    req_obj: JsonRpcRequest
+    if not isinstance(request, dict):
+        req_obj = json.loads(request)
+    else:
+        req_obj = request  # type: ignore
+
+    method = req_obj.get("method", "")
+
+    # initialize 由本地处理
+    if method == "initialize":
+        return dispatch_original(request)
+    
+    # notifications 由本地处理
+    if method.startswith("notifications/"):
+        return dispatch_original(request)
+    
+    # 所有其他请求转发到目标服务器（协调服务器或IDA）
+    return _forward_request(request, req_obj)
 
 
 mcp.registry.dispatch = dispatch_proxy
@@ -848,7 +935,25 @@ def main():
     parser.add_argument(
         "--config", action="store_true", help="Generate MCP config JSON"
     )
+    parser.add_argument(
+        "--coordinator",
+        action="store_true",
+        help="启动多实例协调服务器模式（固定端口: MCP=8800, API=8801）",
+    )
     args = parser.parse_args()
+
+    # 协调服务器模式
+    if args.coordinator:
+        from ida_pro_mcp.coordinator import main as coordinator_main
+        # 构造协调服务器参数
+        sys.argv = [
+            sys.argv[0],
+            "--host", "127.0.0.1",
+            "--port", "8801",
+            "--transport", args.transport,
+        ]
+        coordinator_main()
+        return
 
     # Parse IDA RPC server argument
     ida_rpc = urlparse(args.ida_rpc)

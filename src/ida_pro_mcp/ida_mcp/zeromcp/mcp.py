@@ -267,6 +267,8 @@ class McpServer:
         self.registry.methods["resources/list"] = self._mcp_resources_list
         self.registry.methods["resources/templates/list"] = self._mcp_resource_templates_list
         self.registry.methods["resources/read"] = self._mcp_resources_read
+        self.registry.methods["resources/subscribe"] = self._mcp_resources_subscribe
+        self.registry.methods["resources/unsubscribe"] = self._mcp_resources_unsubscribe
         self.registry.methods["prompts/list"] = self._mcp_prompts_list
         self.registry.methods["prompts/get"] = self._mcp_prompts_get
         self.registry.methods["notifications/cancelled"] = self._mcp_notifications_cancelled
@@ -568,6 +570,14 @@ class McpServer:
             }],
             "isError": True,
         }
+
+    def _mcp_resources_subscribe(self, uri: str, _meta: dict | None = None) -> dict:
+        """MCP resources/subscribe method - acknowledge subscription (no-op for static resources)"""
+        return {}
+
+    def _mcp_resources_unsubscribe(self, uri: str, _meta: dict | None = None) -> dict:
+        """MCP resources/unsubscribe method - acknowledge unsubscription (no-op for static resources)"""
+        return {}
 
     def _mcp_prompts_list(self, _meta: dict | None = None) -> dict:
         """MCP prompts/list method"""

@@ -9,6 +9,7 @@ Architecture:
 - sync.py: IDA synchronization decorator (@idasync)
 - utils.py: Shared helpers and TypedDict definitions
 - api_*.py: Modular API implementations (71 tools + 24 resources)
+- api_instances.py: 多实例协调支持
 """
 
 # Import infrastructure modules
@@ -26,12 +27,19 @@ from . import api_stack
 from . import api_debug
 from . import api_python
 from . import api_resources
+from . import api_instances
 
 # Re-export key components for external use
 from .sync import idasync, IDAError, IDASyncError, CancelledError
 from .rpc import MCP_SERVER, MCP_UNSAFE, tool, unsafe, resource
 from .http import IdaMcpHttpRequestHandler
 from .api_core import init_caches
+from .api_instances import (
+    register_to_coordinator,
+    unregister_from_coordinator,
+    get_registered_instance_id,
+    get_local_tools_list,
+)
 
 __all__ = [
     # Infrastructure modules
@@ -48,6 +56,7 @@ __all__ = [
     "api_debug",
     "api_python",
     "api_resources",
+    "api_instances",
     # Re-exported components
     "idasync",
     "IDAError",
@@ -60,4 +69,9 @@ __all__ = [
     "resource",
     "IdaMcpHttpRequestHandler",
     "init_caches",
+    # 多实例协调
+    "register_to_coordinator",
+    "unregister_from_coordinator",
+    "get_registered_instance_id",
+    "get_local_tools_list",
 ]

@@ -56,7 +56,11 @@ call_stack = queue.LifoQueue()
 
 
 def _sync_wrapper(ff):
-    """Call a function ff with a specific IDA safety_mode."""
+    """Call a function ff on IDA main thread with batch mode enabled.
+    
+    批处理模式(batch mode)必须在IDA主线程中设置和恢复，否则会导致
+    IDA全局状态不一致，影响用户交互（如G键跳转对话框）。
+    """
 
     res_container = queue.Queue()
 
@@ -67,11 +71,15 @@ def _sync_wrapper(ff):
             raise IDASyncError(error_str)
 
         call_stack.put((ff.__name__))
+        # 在IDA主线程中启用batch模式，避免MCP工具触发用户交互对话框
+        old_batch = idc.batch(1)
         try:
             res_container.put(ff())
         except Exception as x:
             res_container.put(x)
         finally:
+            # 在IDA主线程中恢复batch模式状态
+            idc.batch(old_batch)
             call_stack.get()
 
     idaapi.execute_sync(runned, idaapi.MFF_WRITE)
@@ -79,6 +87,7 @@ def _sync_wrapper(ff):
     if isinstance(res, Exception):
         raise res
     return res
+
 
 def _normalize_timeout(value: object) -> float | None:
     if value is None:
@@ -90,40 +99,37 @@ def _normalize_timeout(value: object) -> float | None:
 
 
 def sync_wrapper(ff, timeout_override: float | None = None):
-    """Wrapper to enable batch mode during IDA synchronization."""
+    """Wrapper for IDA synchronization with timeout and cancellation support."""
     # Capture cancel event from thread-local before execute_sync
     cancel_event = get_current_cancel_event()
 
-    old_batch = idc.batch(1)
-    try:
-        timeout = timeout_override
-        if timeout is None:
-            timeout = _get_tool_timeout_seconds()
-        if timeout > 0 or cancel_event is not None:
-            def timed_ff():
-                # Calculate deadline when execution starts on IDA main thread,
-                # not when the request was queued (avoids stale deadlines)
-                deadline = time.monotonic() + timeout if timeout > 0 else None
+    timeout = timeout_override
+    if timeout is None:
+        timeout = _get_tool_timeout_seconds()
 
-                def profilefunc(frame, event, arg):
-                    # Check cancellation first (higher priority)
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise CancelledError("Request was cancelled")
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise IDASyncError(f"Tool timed out after {timeout:.2f}s")
+    if timeout > 0 or cancel_event is not None:
+        def timed_ff():
+            # Calculate deadline when execution starts on IDA main thread,
+            # not when the request was queued (avoids stale deadlines)
+            deadline = time.monotonic() + timeout if timeout > 0 else None
 
-                old_profile = sys.getprofile()
-                sys.setprofile(profilefunc)
-                try:
-                    return ff()
-                finally:
-                    sys.setprofile(old_profile)
+            def profilefunc(frame, event, arg):
+                # Check cancellation first (higher priority)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError("Request was cancelled")
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise IDASyncError(f"Tool timed out after {timeout:.2f}s")
 
-            timed_ff.__name__ = ff.__name__
-            return _sync_wrapper(timed_ff)
-        return _sync_wrapper(ff)
-    finally:
-        idc.batch(old_batch)
+            old_profile = sys.getprofile()
+            sys.setprofile(profilefunc)
+            try:
+                return ff()
+            finally:
+                sys.setprofile(old_profile)
+
+        timed_ff.__name__ = ff.__name__
+        return _sync_wrapper(timed_ff)
+    return _sync_wrapper(ff)
 
 
 def idasync(f):
