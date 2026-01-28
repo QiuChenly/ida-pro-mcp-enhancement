@@ -1,30 +1,18 @@
-"""IDA Pro MCP Plugin Loader
+"""IDA Pro MCP Plugin Loader（HTTP+SSE 版本）
 
-This file serves as the entry point for IDA Pro's plugin system.
-It loads the actual implementation from the ida_mcp package.
-
-支持多实例模式:
-- 启动本地HTTP服务器
-- 自动尝试向协调服务器 (127.0.0.1:8801) 注册
-- 关闭时自动注销
+通过 HTTP+SSE 与 MCP 服务器通信。
+插件加载时自动连接，按 Ctrl+Alt+M 可手动重连。
 """
 
 import os
 import sys
-import socket
-import http.client
-import json
+import threading
 import idaapi
 import idc
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from . import ida_mcp
-
-
-# 协调服务器配置
-COORDINATOR_HOST = "127.0.0.1"
-COORDINATOR_PORT = 8801
 
 
 def unload_package(package_name: str):
@@ -38,9 +26,9 @@ def unload_package(package_name: str):
         del sys.modules[mod_name]
 
 
-def _generate_instance_id(port: int) -> str:
-    """生成实例ID，基于端口和进程ID"""
-    return f"ida-{port}-{os.getpid()}"
+def _generate_instance_id() -> str:
+    """生成实例 ID，基于进程 ID"""
+    return f"ida-{os.getpid()}"
 
 
 def _get_current_binary_path() -> str:
@@ -51,29 +39,43 @@ def _get_current_binary_path() -> str:
         return ""
 
 
-def _check_coordinator_online() -> bool:
-    """检查协调服务器是否在线"""
+def _get_current_binary_name() -> str:
+    """获取当前打开的二进制文件名"""
+    path = _get_current_binary_path()
+    return os.path.basename(path) if path else ""
+
+
+def _get_arch_info() -> dict:
+    """获取当前二进制文件的架构信息"""
     try:
-        conn = http.client.HTTPConnection(COORDINATOR_HOST, COORDINATOR_PORT, timeout=2)
-        conn.request("GET", "/api/ping")
-        response = conn.getresponse()
-        result = json.loads(response.read().decode())
-        conn.close()
-        return result.get("status") == "ok"
-    except Exception:
-        return False
-
-
-def _find_available_port(start_port: int = 10000, end_port: int = 65535) -> int:
-    """找到一个可用的端口"""
-    for port in range(start_port, end_port):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("127.0.0.1", port))
-                return port
-        except OSError:
-            continue
-    raise RuntimeError("无法找到可用端口")
+        import ida_ida
+        
+        proc_name = ida_ida.inf_get_procname() if hasattr(ida_ida, 'inf_get_procname') else ""
+        is_64bit = ida_ida.inf_is_64bit() if hasattr(ida_ida, 'inf_is_64bit') else False
+        bitness = 64 if is_64bit else 32
+        is_be = ida_ida.inf_is_be() if hasattr(ida_ida, 'inf_is_be') else False
+        endian = "big" if is_be else "little"
+        
+        file_type = ida_ida.inf_get_filetype() if hasattr(ida_ida, 'inf_get_filetype') else 0
+        file_type_names = {
+            0: "unknown", 1: "EXE", 2: "COM", 3: "BIN", 4: "DRV", 5: "WIN",
+            6: "HEX", 7: "MEX", 8: "LX", 9: "LE", 10: "NLM", 11: "COFF",
+            12: "PE", 13: "OMF", 14: "SREC", 15: "ZIP", 16: "OMFLIB",
+            17: "AR", 18: "LOADER", 19: "ELF", 20: "W32RUN", 21: "AOUT",
+            22: "PRC", 23: "PILOT", 24: "MACHO", 25: "MACHO64",
+        }
+        file_type_str = file_type_names.get(file_type, f"type_{file_type}")
+        base_addr = hex(idaapi.get_imagebase())
+        
+        return {
+            "processor": proc_name,
+            "bitness": bitness,
+            "endian": endian,
+            "file_type": file_type_str,
+            "base_addr": base_addr,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 class MCP(idaapi.plugin_t):
@@ -83,161 +85,131 @@ class MCP(idaapi.plugin_t):
     wanted_name = "MCP"
     wanted_hotkey = "Ctrl-Alt-M"
 
-    # 配置
-    HOST = "127.0.0.1"
-    DEFAULT_PORT = 13337  # 默认端口（单实例模式使用）
-
     def init(self):
-        hotkey = MCP.wanted_hotkey.replace("-", "+")
-        if __import__("sys").platform == "darwin":
-            hotkey = hotkey.replace("Alt", "Option")
-
-        print(
-            f"[MCP] Plugin loaded, use Edit -> Plugins -> MCP ({hotkey}) to start the server"
-        )
-        self.mcp: "ida_mcp.rpc.McpServer | None" = None
-        self._instance_id: str | None = None
-        self._actual_port: int = self.DEFAULT_PORT
-        self._coordinator_mode: bool = False
+        self._connected = False
+        self._connecting = False  # 正在连接中标志，防止重复连接
+        self._mcp_server = None
+        self._auto_connect_tried = False
+        
+        def auto_connect_timer():
+            if not self._auto_connect_tried:
+                self._auto_connect_tried = True
+                self._try_connect(silent=True)
+            return -1
+        
+        idaapi.register_timer(500, auto_connect_timer)
         return idaapi.PLUGIN_KEEP
 
     def run(self, arg):
-        if self.mcp:
-            # 先注销再停止
-            self._unregister_from_coordinator()
-            self.mcp.stop()
-            self.mcp = None
+        """手动连接/重连（Ctrl+Alt+M）"""
+        self._try_connect(silent=False)
 
-        # HACK: ensure fresh load of ida_mcp package
+    def _try_connect(self, silent: bool = False):
+        """尝试连接到 MCP 服务器（后台线程执行，不阻塞 UI）"""
+        if self._connecting:
+            if not silent:
+                print("[MCP] 正在连接中，请稍候...")
+            return
+        
+        if self._connected:
+            self._disconnect()
+        
+        self._connecting = True
+        
+        # 在 UI 线程准备参数
         unload_package("ida_mcp")
+        
         if TYPE_CHECKING:
             from .ida_mcp import (
                 MCP_SERVER,
-                IdaMcpHttpRequestHandler,
-                init_caches,
-                register_to_coordinator,
-                unregister_from_coordinator,
-                get_local_tools_list,
+                connect_to_server,
+                disconnect,
+                is_connected,
+                set_auto_reconnect,
             )
         else:
             from ida_mcp import (
                 MCP_SERVER,
-                IdaMcpHttpRequestHandler,
-                init_caches,
-                register_to_coordinator,
-                unregister_from_coordinator,
-                get_local_tools_list,
+                connect_to_server,
+                disconnect,
+                is_connected,
+                set_auto_reconnect,
             )
-
-        try:
-            init_caches()
-        except Exception as e:
-            print(f"[MCP] Cache init failed: {e}")
-
-        # 先检查协调服务器是否在线
-        self._coordinator_mode = _check_coordinator_online()
         
-        if self._coordinator_mode:
-            # 协调服务器在线：动态分配端口
-            print(f"[MCP] 检测到协调服务器在线，使用动态端口分配...")
-            try:
-                port = _find_available_port()
-            except RuntimeError as e:
-                print(f"[MCP] 错误: {e}")
-                return
-        else:
-            # 协调服务器不在线：使用默认端口（兼容单实例模式）
-            print(f"[MCP] 协调服务器离线，使用默认端口 {self.DEFAULT_PORT}")
-            port = self.DEFAULT_PORT
+        set_auto_reconnect(True)
+        self._mcp_server = MCP_SERVER
 
-        # 启动服务器
-        max_attempts = 10 if not self._coordinator_mode else 1
+        instance_id = _generate_instance_id()
+        binary_path = _get_current_binary_path()
+        binary_name = _get_current_binary_name()
+        arch_info = _get_arch_info()
+
+        def handle_mcp_request(request: dict) -> dict:
+            """处理来自服务器的 MCP 请求"""
+            return MCP_SERVER.registry.dispatch(request)
+
+        if not silent:
+            print("[MCP] 正在连接到 MCP 服务器...")
         
-        for attempt in range(max_attempts):
+        def do_connect():
+            """后台线程执行连接"""
             try:
-                MCP_SERVER.serve(
-                    self.HOST, port, request_handler=IdaMcpHttpRequestHandler
+                success = connect_to_server(
+                    instance_id=instance_id,
+                    instance_type="gui",
+                    name=binary_name or f"IDA-{os.getpid()}",
+                    binary_path=binary_path,
+                    arch_info=arch_info,
+                    on_mcp_request=handle_mcp_request,
                 )
-                print(f"[MCP] Server started:")
-                print(f"  Streamable HTTP: http://{self.HOST}:{port}/mcp")
-                print(f"  SSE: http://{self.HOST}:{port}/sse")
-                print(f"  Config: http://{self.HOST}:{port}/config.html")
-                self.mcp = MCP_SERVER
-                self._actual_port = port
-                break
-            except OSError as e:
-                if e.errno in (48, 98, 10048):  # Address already in use
-                    if attempt < max_attempts - 1:
-                        port += 1
-                        print(f"[MCP] Port {port - 1} in use, trying {port}...")
+
+                # 连接完成后在 UI 线程更新状态
+                def update_status():
+                    self._connecting = False
+                    if success:
+                        self._connected = True
+                        print(f"[MCP] 已连接 ({binary_name or 'IDA'})")
                     else:
-                        print(f"[MCP] Error: Could not find available port after {max_attempts} attempts")
-                        return
-                else:
-                    raise
+                        if silent:
+                            print("[MCP] 自动连接失败，按 Ctrl+Alt+M 手动重试")
+                        else:
+                            print("[MCP] 连接失败，请确保 Cursor 已启动")
+                    return -1  # 不重复执行
+                
+                idaapi.execute_sync(lambda: update_status(), idaapi.MFF_WRITE)
+            except Exception as e:
+                def report_error():
+                    self._connecting = False
+                    print(f"[MCP] 连接异常: {e}")
+                    return -1
+                idaapi.execute_sync(lambda: report_error(), idaapi.MFF_WRITE)
+        
+        # 启动后台线程执行连接
+        thread = threading.Thread(target=do_connect, daemon=True)
+        thread.start()
 
-        # 如果协调服务器在线，注册此实例
-        if self.mcp and self._coordinator_mode:
-            self._register_to_coordinator()
-
-    def _register_to_coordinator(self):
-        """向协调服务器注册此实例"""
-        try:
-            if TYPE_CHECKING:
-                from .ida_mcp import register_to_coordinator, get_local_tools_list
-            else:
-                from ida_mcp import register_to_coordinator, get_local_tools_list
-
-            self._instance_id = _generate_instance_id(self._actual_port)
-            binary_path = _get_current_binary_path()
-            
-            # 获取本地工具列表
-            tools = get_local_tools_list()
-
-            result = register_to_coordinator(
-                instance_id=self._instance_id,
-                instance_type="gui",
-                port=self._actual_port,
-                host=self.HOST,
-                name=os.path.basename(binary_path) if binary_path else f"IDA:{self._actual_port}",
-                binary_path=binary_path,
-                tools=tools,
-            )
-
-            if result.get("success"):
-                print(f"[MCP] 多实例模式: 已注册到协调服务器 ({COORDINATOR_HOST}:{COORDINATOR_PORT})")
-            else:
-                self._instance_id = None
-                print(f"[MCP] 注册失败: {result.get('error', '未知错误')}")
-        except Exception as e:
-            self._instance_id = None
-            print(f"[MCP] 注册时出错: {e}")
-
-    def _unregister_from_coordinator(self):
-        """从协调服务器注销此实例"""
-        if not self._instance_id:
+    def _disconnect(self):
+        """断开与服务器的连接"""
+        if not self._connected:
             return
-
+        
         try:
             if TYPE_CHECKING:
-                from .ida_mcp import unregister_from_coordinator
+                from .ida_mcp import disconnect
             else:
-                from ida_mcp import unregister_from_coordinator
-
-            unregister_from_coordinator()
-            self._instance_id = None
-        except Exception as e:
-            print(f"[MCP] 注销时出错: {e}")
+                from ida_mcp import disconnect
+            
+            disconnect()
+            self._connected = False
+        except Exception:
+            pass
 
     def term(self):
-        if self.mcp:
-            self._unregister_from_coordinator()
-            self.mcp.stop()
+        self._disconnect()
 
 
 def PLUGIN_ENTRY():
     return MCP()
 
 
-# IDA plugin flags
 PLUGIN_FLAGS = idaapi.PLUGIN_HIDE | idaapi.PLUGIN_FIX
