@@ -2,14 +2,11 @@
 
 import re
 import time
-from typing import Annotated, Optional
+from typing import Annotated
 
-import ida_hexrays
 import idaapi
 import idautils
 import ida_nalt
-import ida_typeinf
-import ida_segment
 
 from .rpc import tool
 from .sync import idasync
@@ -37,29 +34,23 @@ def init_caches():
     t0 = time.perf_counter()
     strings = _get_strings_cache()
     t1 = time.perf_counter()
-    print(f"[MCP] Cached {len(strings)} strings in {(t1-t0)*1000:.0f}ms")
+    print(f"[MCP] Cached {len(strings)} strings in {(t1 - t0) * 1000:.0f}ms")
 
 
 from .utils import (
-    Metadata,
     Function,
     ConvertedNumber,
     Global,
     Import,
-    String,
-    Segment,
     Page,
     NumberConversion,
     ListQuery,
-    get_image_size,
-    parse_address,
     normalize_list_input,
     normalize_dict_list,
     get_function,
     paginate,
     pattern_filter,
 )
-from .sync import IDAError
 
 
 # ============================================================================
@@ -326,4 +317,3 @@ def find_regex(
         "matches": matches,
         "cursor": {"next": offset + limit} if more else {"done": True},
     }
-

@@ -198,7 +198,9 @@ class StructRead(TypedDict, total=False):
     """
 
     addr: Annotated[str, "Memory address (hex or decimal)"]
-    struct: Annotated[NotRequired[str], "Structure name (optional, auto-detect if omitted)"]
+    struct: Annotated[
+        NotRequired[str], "Structure name (optional, auto-detect if omitted)"
+    ]
 
 
 class TypeEdit(TypedDict, total=False):
@@ -226,6 +228,23 @@ class StackVarDelete(TypedDict):
 
     addr: Annotated[str, "Function address"]
     name: Annotated[str, "Variable name"]
+
+
+class DefineOp(TypedDict, total=False):
+    """Define function/code operation"""
+
+    addr: Annotated[
+        str, "Address to define (hex or decimal). Use 'start:end' for explicit bounds."
+    ]
+    end: Annotated[str, "Optional end address for explicit bounds"]
+
+
+class UndefineOp(TypedDict, total=False):
+    """Undefine operation"""
+
+    addr: Annotated[str, "Address to undefine (hex or decimal)"]
+    end: Annotated[str, "Optional end address"]
+    size: Annotated[int, "Optional size in bytes"]
 
 
 # ============================================================================
@@ -733,6 +752,8 @@ def pattern_filter(data: list[T], pattern: str, key: str) -> list[T]:
 
 
 def refresh_decompiler_widget():
+    if not ida_hexrays.init_hexrays_plugin():
+        return
     widget = ida_kernwin.get_current_widget()
     if widget is not None:
         vu = ida_hexrays.get_widget_vdui(widget)
@@ -741,6 +762,8 @@ def refresh_decompiler_widget():
 
 
 def refresh_decompiler_ctext(fn_addr: int):
+    if not ida_hexrays.init_hexrays_plugin():
+        return
     error = ida_hexrays.hexrays_failure_t()
     cfunc: ida_hexrays.cfunc_t = ida_hexrays.decompile_func(
         fn_addr, error, ida_hexrays.DECOMP_WARNINGS

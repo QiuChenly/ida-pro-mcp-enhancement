@@ -272,10 +272,7 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
 mcp.registry.dispatch = dispatch_proxy
 
 
-# ============================================================================
-# 主入口
-# ============================================================================
-
+# =====================================================================
 def main():
     global HTTP_SERVER, _stdio_stdout, _broker_client
 

@@ -1,4 +1,5 @@
 from typing import Annotated
+import ast
 import io
 import sys
 import idaapi
@@ -112,49 +113,54 @@ def py_eval(
         }
 
         result_value = None
+        exec_locals = {}
 
-        # Try evaluation first (for simple expressions)
+        # Parse code with AST to properly handle execution
         try:
-            result_value = str(eval(code, exec_globals))
-        except Exception:
-            # Execute as statements
-            exec_locals = {}
+            tree = ast.parse(code)
+        except SyntaxError:
+            # If parsing fails, fall back to direct exec
             exec(code, exec_globals, exec_locals)
-
-            # Merge locals into globals for multi-statement blocks
             exec_globals.update(exec_locals)
-
-            # Try to eval the last line as an expression (Jupyter-style)
-            lines = code.strip().split("\n")
-            if lines:
-                last_line = lines[-1].strip()
-                if last_line and not last_line.startswith(
-                    (
-                        "#",
-                        "import ",
-                        "from ",
-                        "def ",
-                        "class ",
-                        "if ",
-                        "for ",
-                        "while ",
-                        "with ",
-                        "try:",
-                    )
-                ):
-                    try:
-                        result_value = str(eval(last_line, exec_globals))
-                    except Exception:
-                        pass
-
-            # Return 'result' variable if explicitly set
-            if result_value is None and "result" in exec_locals:
+            if "result" in exec_locals:
                 result_value = str(exec_locals["result"])
-
-            # Return last assigned variable
-            if result_value is None and exec_locals:
+            elif exec_locals:
                 last_key = list(exec_locals.keys())[-1]
                 result_value = str(exec_locals[last_key])
+        else:
+            if not tree.body:
+                # Empty code
+                pass
+            elif len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr):
+                # Single expression - use eval
+                result_value = str(eval(code, exec_globals))
+            elif isinstance(tree.body[-1], ast.Expr):
+                # Multiple statements, last one is an expression (Jupyter-style)
+                # Execute all statements except the last
+                if len(tree.body) > 1:
+                    exec_tree = ast.Module(body=tree.body[:-1], type_ignores=[])
+                    exec(
+                        compile(exec_tree, "<string>", "exec"),
+                        exec_globals,
+                        exec_locals,
+                    )
+                    exec_globals.update(exec_locals)
+                # Eval only the last expression
+                eval_tree = ast.Expression(body=tree.body[-1].value)
+                result_value = str(
+                    eval(compile(eval_tree, "<string>", "eval"), exec_globals)
+                )
+            else:
+                # All statements (no trailing expression)
+                exec(code, exec_globals, exec_locals)
+                exec_globals.update(exec_locals)
+                # Return 'result' variable if explicitly set
+                if "result" in exec_locals:
+                    result_value = str(exec_locals["result"])
+                # Return last assigned variable
+                elif exec_locals:
+                    last_key = list(exec_locals.keys())[-1]
+                    result_value = str(exec_locals[last_key])
 
         # Collect output
         stdout_text = stdout_capture.getvalue()

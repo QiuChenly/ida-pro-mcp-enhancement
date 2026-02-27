@@ -3,20 +3,12 @@
 # Import test framework from parent
 from ..framework import (
     test,
-    assert_valid_address,
     assert_has_keys,
-    assert_non_empty,
     assert_is_list,
-    assert_all_have_keys,
-    get_any_function,
     get_any_string,
     get_first_segment,
-    get_n_functions,
-    get_n_strings,
     get_data_address,
     get_unmapped_address,
-    get_functions_with_calls,
-    get_functions_with_callers,
 )
 
 # Import functions under test
@@ -26,11 +18,9 @@ from ..api_memory import (
     get_string,
     get_global_value,
     patch,
-    put_int,
 )
 
 # Import sync module for IDAError
-from ..sync import IDAError
 
 
 # ============================================================================
@@ -170,9 +160,9 @@ def test_get_global_value():
 # ============================================================================
 
 
-@test(skip=True)  # Skip by default as it modifies the database
-def test_patch():
-    """patch writes bytes to address"""
+@test()
+def test_patch_roundtrip():
+    """patch writes bytes and restores original"""
     seg = get_first_segment()
     if not seg:
         return
@@ -180,16 +170,18 @@ def test_patch():
     start_addr, _ = seg
     # Read original bytes first
     original = get_bytes({"addr": start_addr, "size": 4})
+    if not original or not original[0].get("hex"):
+        return
 
     try:
         result = patch({"addr": start_addr, "hex": "90909090"})
         assert_is_list(result, min_length=1)
         r = result[0]
-        assert_has_keys(r, "addr", "error")
+        assert_has_keys(r, "addr")
+        assert r.get("ok") is True or r.get("error") is None
     finally:
         # Restore original bytes
-        if original and original[0].get("hex"):
-            patch({"addr": start_addr, "hex": original[0]["hex"]})
+        patch({"addr": start_addr, "hex": original[0]["hex"]})
 
 
 @test()

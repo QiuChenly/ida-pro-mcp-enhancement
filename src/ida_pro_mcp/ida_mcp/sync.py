@@ -4,9 +4,7 @@ import functools
 import os
 import sys
 import time
-from enum import IntEnum
 import idaapi
-import ida_kernwin
 import idc
 from .rpc import McpToolError
 from .zeromcp.jsonrpc import get_current_cancel_event, RequestCancelledError
@@ -33,6 +31,7 @@ class IDASyncError(Exception):
 
 class CancelledError(RequestCancelledError):
     """Raised when a request is cancelled via notifications/cancelled."""
+
     pass
 
 
@@ -49,7 +48,6 @@ def _get_tool_timeout_seconds() -> float:
         return float(value)
     except ValueError:
         return _DEFAULT_TOOL_TIMEOUT_SEC
-
 
 
 call_stack = queue.LifoQueue()
@@ -71,14 +69,13 @@ def _sync_wrapper(ff):
             raise IDASyncError(error_str)
 
         call_stack.put((ff.__name__))
-        # 在IDA主线程中启用batch模式，避免MCP工具触发用户交互对话框
+        # Enable batch mode for all synchronized operations
         old_batch = idc.batch(1)
         try:
             res_container.put(ff())
         except Exception as x:
             res_container.put(x)
         finally:
-            # 在IDA主线程中恢复batch模式状态
             idc.batch(old_batch)
             call_stack.get()
 
@@ -99,15 +96,19 @@ def _normalize_timeout(value: object) -> float | None:
 
 
 def sync_wrapper(ff, timeout_override: float | None = None):
-    """Wrapper for IDA synchronization with timeout and cancellation support."""
+    """Wrapper to enable timeout and cancellation during IDA synchronization.
+
+    Note: Batch mode is now handled in _sync_wrapper to ensure it's always
+    applied consistently for all synchronized operations.
+    """
     # Capture cancel event from thread-local before execute_sync
     cancel_event = get_current_cancel_event()
 
     timeout = timeout_override
     if timeout is None:
         timeout = _get_tool_timeout_seconds()
-
     if timeout > 0 or cancel_event is not None:
+
         def timed_ff():
             # Calculate deadline when execution starts on IDA main thread,
             # not when the request was queued (avoids stale deadlines)
@@ -134,7 +135,7 @@ def sync_wrapper(ff, timeout_override: float | None = None):
 
 def idasync(f):
     """Run the function on the IDA main thread in write mode.
-    
+
     This is the unified decorator for all IDA synchronization.
     Previously there were separate @idaread and @idawrite decorators,
     but since read-only operations in IDA might actually require write
@@ -153,11 +154,6 @@ def idasync(f):
     return wrapper
 
 
-# Backwards compatibility aliases
-idaread = idasync
-idawrite = idasync
-
-
 def tool_timeout(seconds: float):
     """Decorator to override per-tool timeout (seconds).
 
@@ -170,9 +166,11 @@ def tool_timeout(seconds: float):
         @tool_timeout(90.0)  # innermost
         def my_func(...):
     """
+
     def decorator(func):
         setattr(func, "__ida_mcp_timeout_sec__", seconds)
         return func
+
     return decorator
 
 
@@ -180,12 +178,12 @@ def is_window_active():
     """Returns whether IDA is currently active."""
     # Source: https://github.com/OALabs/hexcopy-ida/blob/8b0b2a3021d7dc9010c01821b65a80c47d491b61/hexcopy.py#L30
     using_pyside6 = (ida_major > 9) or (ida_major == 9 and ida_minor >= 2)
-    
+
     if using_pyside6:
         from PySide6 import QtWidgets
     else:
         from PyQt5 import QtWidgets
-    
+
     app = QtWidgets.QApplication.instance()
     if app is None:
         return False

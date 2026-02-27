@@ -115,9 +115,7 @@ def get_int(
                 {"addr": addr, "ty": normalized, "value": value, "error": None}
             )
         except Exception as e:
-            results.append(
-                {"addr": addr, "ty": ty, "value": None, "error": str(e)}
-            )
+            results.append({"addr": addr, "ty": ty, "value": None, "error": str(e)})
 
     return results
 
@@ -168,7 +166,7 @@ def get_global_variable_value_internal(ea: int) -> str:
     if size == 0 and tif.is_array() and tif.get_array_element().is_decl_char():
         raw = idaapi.get_strlit_contents(ea, -1, 0)
         if not raw:
-            return "\"\""
+            return '""'
         return_string = raw.decode("utf-8", errors="replace").strip()
         return f'"{return_string}"'
     elif size == 1:

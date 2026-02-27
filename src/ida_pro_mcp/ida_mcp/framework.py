@@ -75,7 +75,7 @@ def test(*, binary: str = "", skip: bool = False) -> Callable:
             category = module_name.rsplit(".", 1)[-1]
         else:
             category = module_name
-        
+
         # Remove "test_" prefix if present (for separate test files)
         if category.startswith("test_"):
             category = category[5:]

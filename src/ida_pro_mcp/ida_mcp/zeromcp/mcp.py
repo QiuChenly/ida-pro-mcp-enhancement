@@ -3,6 +3,8 @@ import sys
 import time
 import uuid
 import json
+import gzip
+import zlib
 import inspect
 import threading
 import traceback
@@ -128,14 +130,9 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "Not Found")
 
     def do_POST(self):
-        # Read request body
-        content_length = int(self.headers.get("Content-Length", 0))
-
-        if content_length > self.mcp_server.post_body_limit:
-            self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes")
+        body = self._read_body()
+        if body is None:
             return
-
-        body = self.rfile.read(content_length) if content_length > 0 else b""
 
         match urlparse(self.path).path:
             case "/sse":
@@ -150,6 +147,47 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_cors_headers(preflight=True)
         self.end_headers()
+
+    def _read_body(self) -> bytes | None:
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            raw = self._read_chunked()
+        else:
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length > self.mcp_server.post_body_limit:
+                self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes")
+                return None
+            raw = self.rfile.read(content_length) if content_length > 0 else b""
+
+        if len(raw) > self.mcp_server.post_body_limit:
+            self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes")
+            return None
+
+        return self._decompress_body(raw)
+
+    def _read_chunked(self) -> bytes:
+        body = b""
+        while True:
+            line = self.rfile.readline().split(b";")[0].strip()
+            chunk_size = int(line, 16)
+            if chunk_size == 0:
+                # Consume trailer fields until blank line
+                while self.rfile.readline().strip():
+                    pass
+                break
+            body += self.rfile.read(chunk_size)
+            self.rfile.readline()
+        return body
+
+    def _decompress_body(self, data: bytes) -> bytes:
+        encoding = self.headers.get("Content-Encoding", "").lower().strip()
+        if encoding in ("gzip", "x-gzip"):
+            return gzip.decompress(data)
+        elif encoding == "deflate":
+            if data[:1] == b'\x78':
+                return zlib.decompress(data)
+            else:
+                return zlib.decompress(data, -15)
+        return data
 
     def _handle_sse_get(self):
         # Create SSE connection wrapper

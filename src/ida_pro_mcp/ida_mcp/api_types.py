@@ -17,8 +17,6 @@ from .utils import (
     get_type_by_name,
     parse_decls_ctypes,
     my_modifier_t,
-    StructureMember,
-    StructureDefinition,
     StructRead,
     TypeEdit,
 )
@@ -189,7 +187,9 @@ def read_struct(queries: list[StructRead] | StructRead) -> list[dict]:
                         bytes_data = []
                         for i in range(min(member_size, 16)):
                             try:
-                                bytes_data.append(f"{idaapi.get_byte(member_addr + i):02X}")
+                                bytes_data.append(
+                                    f"{idaapi.get_byte(member_addr + i):02X}"
+                                )
                             except Exception:
                                 break
                         value_str = f"[{' '.join(bytes_data)}{'...' if member_size > 16 else ''}]"

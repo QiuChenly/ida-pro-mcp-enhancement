@@ -6,6 +6,8 @@ import ida_bytes
 import ida_typeinf
 import ida_frame
 import ida_dirtree
+import ida_funcs
+import ida_ua
 
 from .rpc import tool
 from .sync import idasync, IDAError
@@ -20,6 +22,8 @@ from .utils import (
     LocalRename,
     StackRename,
     RenameBatch,
+    DefineOp,
+    UndefineOp,
 )
 
 
@@ -396,3 +400,138 @@ def rename(batch: RenameBatch) -> dict:
         result["stack"] = _rename_stack(_normalize_items(batch["stack"]))
 
     return result
+
+
+@tool
+@idasync
+def define_func(items: list[DefineOp] | DefineOp) -> list[dict]:
+    """Define function(s) at address(es). IDA auto-determines bounds unless end address specified."""
+    if isinstance(items, dict):
+        items = [items]
+
+    results = []
+    for item in items:
+        addr_str = item.get("addr", "")
+        end_str = item.get("end", "")
+
+        try:
+            start_ea = parse_address(addr_str)
+            end_ea = parse_address(end_str) if end_str else idaapi.BADADDR
+
+            # Check if already a function
+            existing = idaapi.get_func(start_ea)
+            if existing and existing.start_ea == start_ea:
+                results.append(
+                    {
+                        "addr": addr_str,
+                        "start": hex(start_ea),
+                        "error": "Function already exists at this address",
+                    }
+                )
+                continue
+
+            success = ida_funcs.add_func(start_ea, end_ea)
+            if success:
+                func = idaapi.get_func(start_ea)
+                results.append(
+                    {
+                        "addr": addr_str,
+                        "start": hex(func.start_ea),
+                        "end": hex(func.end_ea),
+                        "ok": True,
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "addr": addr_str,
+                        "start": hex(start_ea),
+                        "error": "define_func failed",
+                    }
+                )
+        except Exception as e:
+            results.append({"addr": addr_str, "error": str(e)})
+
+    return results
+
+
+@tool
+@idasync
+def define_code(items: list[DefineOp] | DefineOp) -> list[dict]:
+    """Convert bytes to code instruction(s) at address(es)."""
+    if isinstance(items, dict):
+        items = [items]
+
+    results = []
+    for item in items:
+        addr_str = item.get("addr", "")
+
+        try:
+            ea = parse_address(addr_str)
+            length = ida_ua.create_insn(ea)
+            if length > 0:
+                results.append(
+                    {"addr": addr_str, "ea": hex(ea), "length": length, "ok": True}
+                )
+            else:
+                results.append(
+                    {
+                        "addr": addr_str,
+                        "ea": hex(ea),
+                        "error": "Failed to create instruction",
+                    }
+                )
+        except Exception as e:
+            results.append({"addr": addr_str, "error": str(e)})
+
+    return results
+
+
+@tool
+@idasync
+def undefine(items: list[UndefineOp] | UndefineOp) -> list[dict]:
+    """Undefine item(s) at address(es), converting back to raw bytes."""
+    if isinstance(items, dict):
+        items = [items]
+
+    results = []
+    for item in items:
+        addr_str = item.get("addr", "")
+        end_str = item.get("end", "")
+        size = item.get("size", 0)
+
+        try:
+            start_ea = parse_address(addr_str)
+
+            # Determine size from end address or explicit size
+            if end_str:
+                end_ea = parse_address(end_str)
+                nbytes = end_ea - start_ea
+            elif size:
+                nbytes = size
+            else:
+                # Default: undefine single item
+                nbytes = 1
+
+            success = ida_bytes.del_items(start_ea, ida_bytes.DELIT_EXPAND, nbytes)
+            if success:
+                results.append(
+                    {
+                        "addr": addr_str,
+                        "start": hex(start_ea),
+                        "size": nbytes,
+                        "ok": True,
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "addr": addr_str,
+                        "start": hex(start_ea),
+                        "error": "undefine failed",
+                    }
+                )
+        except Exception as e:
+            results.append({"addr": addr_str, "error": str(e)})
+
+    return results

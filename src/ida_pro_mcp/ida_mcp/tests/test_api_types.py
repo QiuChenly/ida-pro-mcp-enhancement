@@ -3,20 +3,12 @@
 # Import test framework from parent
 from ..framework import (
     test,
-    assert_valid_address,
     assert_has_keys,
-    assert_non_empty,
     assert_is_list,
-    assert_all_have_keys,
     get_any_function,
-    get_any_string,
     get_first_segment,
-    get_n_functions,
-    get_n_strings,
     get_data_address,
     get_unmapped_address,
-    get_functions_with_calls,
-    get_functions_with_callers,
 )
 
 # Import functions under test
@@ -29,12 +21,12 @@ from ..api_types import (
 )
 
 # Import sync module for IDAError
-from ..sync import IDAError
 
 
 # ============================================================================
 # Test Helpers
 # ============================================================================
+
 
 def create_test_struct(name: str = "__TestStruct__") -> bool:
     """Helper to create a test struct in IDA's type library.
@@ -145,6 +137,7 @@ def test_read_struct_name_resolution():
 
     # Get the function name
     from ..api_core import lookup_funcs
+
     fn_info = lookup_funcs(fn_addr)
     if not fn_info or not fn_info[0].get("fn"):
         return
@@ -165,7 +158,9 @@ def test_read_struct_name_resolution():
 @test()
 def test_read_struct_invalid_address():
     """read_struct handles invalid address gracefully"""
-    result = read_struct({"addr": "InvalidAddressName123", "struct": "NonExistentStruct"})
+    result = read_struct(
+        {"addr": "InvalidAddressName123", "struct": "NonExistentStruct"}
+    )
     assert_is_list(result, min_length=1)
     r = result[0]
     # Should have error about failed address resolution
