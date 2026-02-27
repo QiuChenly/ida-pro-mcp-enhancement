@@ -8,9 +8,133 @@
 
 import ast
 import os
-import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+# TypedDict 解析器导出的注册表：{TypeName: {"properties": {...}, "required": [...]}}
+_TYPEDDICT_REGISTRY: dict[str, dict] = {}
+
+
+class TypedDictParser(ast.NodeVisitor):
+    """AST 解析器，从 utils.py 提取 TypedDict 类定义"""
+
+    def __init__(self):
+        self.registry: dict[str, dict] = {}
+
+    def visit_ClassDef(self, node: ast.ClassDef):
+        if not node.bases:
+            self.generic_visit(node)
+            return
+        base_names = []
+        total_false = False
+        for base in node.bases:
+            if isinstance(base, ast.Name):
+                base_names.append(base.id)
+            elif isinstance(base, ast.Tuple):
+                for elt in base.elts:
+                    if isinstance(elt, ast.Name):
+                        base_names.append(elt.id)
+        for kw in (node.keywords or []):
+            if kw.arg == "total" and isinstance(kw.value, ast.Constant) and kw.value.value is False:
+                total_false = True
+                break
+        if "TypedDict" in base_names:
+            schema = self._parse_typeddict_body(node, total_false)
+            if schema:
+                self.registry[node.name] = schema
+        self.generic_visit(node)
+
+    def _parse_typeddict_body(self, node: ast.ClassDef, total_false: bool) -> dict | None:
+        properties = {}
+        required = []
+        for stmt in node.body:
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                field_name = stmt.target.id
+                type_schema, is_required = self._parse_field_annotation(stmt.annotation, total_false)
+                if type_schema is not None:
+                    properties[field_name] = type_schema
+                    if is_required:
+                        required.append(field_name)
+        if not properties:
+            return None
+        return {"type": "object", "properties": properties, "required": required}
+
+    def _parse_field_annotation(self, node: ast.expr, default_optional: bool) -> tuple[dict | None, bool]:
+        is_required = not default_optional
+        if isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Name):
+                if node.value.id == "Annotated" and isinstance(node.slice, ast.Tuple) and len(node.slice.elts) >= 2:
+                    type_node = node.slice.elts[0]
+                    desc_node = node.slice.elts[1]
+                    desc = ""
+                    if isinstance(desc_node, ast.Constant):
+                        desc = str(desc_node.value)
+                    type_schema = self._type_node_to_schema(type_node)
+                    if type_schema and desc:
+                        type_schema = {**type_schema, "description": desc}
+                    is_req = self._is_required_type(type_node) and not default_optional
+                    return type_schema, is_req
+                elif node.value.id == "NotRequired":
+                    inner = node.slice if not isinstance(node.slice, ast.Tuple) else node.slice.elts[0]
+                    type_schema = self._type_node_to_schema(inner)
+                    desc = ""
+                    if isinstance(inner, ast.Subscript) and isinstance(inner.value, ast.Name) and inner.value.id == "Annotated":
+                        if isinstance(inner.slice, ast.Tuple) and len(inner.slice.elts) >= 2 and isinstance(inner.slice.elts[1], ast.Constant):
+                            desc = str(inner.slice.elts[1].value)
+                            type_schema = self._type_node_to_schema(inner.slice.elts[0])
+                    if type_schema and desc:
+                        type_schema = {**type_schema, "description": desc}
+                    return type_schema, False
+            type_schema = self._type_node_to_schema(node)
+            return type_schema, is_required
+        type_schema = self._type_node_to_schema(node)
+        return type_schema, is_required
+
+    def _is_required_type(self, node: ast.expr) -> bool:
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            if node.value.id == "NotRequired":
+                return False
+        return True
+
+    def _type_node_to_schema(self, node: ast.expr) -> dict | None:
+        if isinstance(node, ast.Name):
+            return self._simple_type_to_schema(node.id)
+        if isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Name):
+                if node.value.id == "list":
+                    inner = node.slice if not isinstance(node.slice, ast.Tuple) else node.slice.elts[0]
+                    inner_schema = self._type_node_to_schema(inner)
+                    if inner_schema:
+                        return {"type": "array", "items": inner_schema}
+                elif node.value.id == "dict":
+                    return {"type": "object"}
+        return {"type": "object"}
+
+    def _simple_type_to_schema(self, name: str) -> dict:
+        m = {"str": "string", "int": "integer", "float": "number", "bool": "boolean"}
+        if name in m:
+            return {"type": m[name]}
+        return {"type": "object"}
+
+
+def _load_typeddict_registry():
+    """从 utils.py 加载 TypedDict 注册表（仅 AST，不执行）"""
+    global _TYPEDDICT_REGISTRY
+    if _TYPEDDICT_REGISTRY:
+        return
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    utils_path = os.path.join(script_dir, "ida_mcp", "utils.py")
+    if not os.path.isfile(utils_path):
+        return
+    try:
+        with open(utils_path, "r", encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source)
+        parser = TypedDictParser()
+        parser.visit(tree)
+        _TYPEDDICT_REGISTRY.update(parser.registry)
+    except Exception:
+        pass
 
 
 @dataclass
@@ -263,16 +387,16 @@ def parse_all_api_files(api_dir: str) -> tuple[list[ToolDef], list[ResourceDef]]
 
 def type_str_to_json_schema(type_str: str) -> dict:
     """将类型字符串转换为JSON Schema"""
+    _load_typeddict_registry()
     type_str = type_str.strip()
     
-    # 处理 Union 类型 (int | str)
+    # 处理 Union 类型 (list[str] | str)
     if " | " in type_str:
         parts = [p.strip() for p in type_str.split(" | ")]
-        # 简化处理：返回第一个非None类型
-        for p in parts:
-            if p.lower() not in ("none", "nonetype"):
-                return type_str_to_json_schema(p)
-        return {"type": "null"}
+        non_none = [p for p in parts if p.lower() not in ("none", "nonetype")]
+        if len(non_none) == 1:
+            return type_str_to_json_schema(non_none[0])
+        return {"anyOf": [type_str_to_json_schema(p) for p in non_none]}
     
     # 处理 Optional[T]
     if type_str.startswith("Optional[") and type_str.endswith("]"):
@@ -303,7 +427,10 @@ def type_str_to_json_schema(type_str: str) -> dict:
     if base_type in type_map:
         return type_map[base_type]
     
-    # 复杂类型（如 TypedDict）作为 object 处理
+    # 查询 TypedDict 注册表
+    if base_type in _TYPEDDICT_REGISTRY:
+        return dict(_TYPEDDICT_REGISTRY[base_type])
+    
     return {"type": "object"}
 
 

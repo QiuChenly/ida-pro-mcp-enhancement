@@ -17,6 +17,7 @@ from .rpc import tool
 from .sync import idasync, tool_timeout
 from .utils import (
     parse_address,
+    parse_address_or_name,
     normalize_list_input,
     get_function,
     get_prototype,
@@ -181,11 +182,14 @@ def _resolve_immediate_insn_start(
 @idasync
 @tool_timeout(90.0)
 def decompile(
-    addr: Annotated[str, "Function address to decompile"],
+    addr: Annotated[
+        str,
+        "函数地址或名称。支持: 0x401000、401000、sub_401000、start、main。",
+    ],
 ) -> dict:
-    """Decompile function to pseudocode"""
+    """反编译函数为伪代码(C 风格)。输入地址或符号名。返回 addr,code。失败返回 error。"""
     try:
-        start = parse_address(addr)
+        start = parse_address_or_name(addr)
         code = decompile_function_safe(start)
         if code is None:
             return {"addr": addr, "code": None, "error": "Decompilation failed"}
@@ -198,7 +202,10 @@ def decompile(
 @idasync
 @tool_timeout(90.0)
 def disasm(
-    addr: Annotated[str, "Function address to disassemble"],
+    addr: Annotated[
+        str,
+        "函数地址或名称。支持: 0x401000、start、main。",
+    ],
     max_instructions: Annotated[
         int, "Max instructions per function (default: 5000, max: 50000)"
     ] = 5000,
@@ -207,7 +214,7 @@ def disasm(
         bool, "Compute total instruction count (default: false)"
     ] = False,
 ) -> dict:
-    """Disassemble function to assembly instructions"""
+    """反汇编函数为汇编指令。输入地址或符号名。返回 addr,asm(行列表),cursor。支持 offset/分页。"""
 
     # Enforce max limit
     if max_instructions <= 0 or max_instructions > 50000:
@@ -216,7 +223,7 @@ def disasm(
         offset = 0
 
     try:
-        start = parse_address(addr)
+        start = parse_address_or_name(addr)
         func = idaapi.get_func(start)
 
         # Get segment info
@@ -342,7 +349,10 @@ def disasm(
 @tool
 @idasync
 def xrefs_to(
-    addrs: Annotated[list[str] | str, "Addresses to find cross-references to"],
+    addrs: Annotated[
+        list[str] | str,
+        "目标地址。支持 hex、符号名、逗号分隔。例: '0x401000'、'main, 0x402000'",
+    ],
     limit: Annotated[int, "Max xrefs per address (default: 100, max: 1000)"] = 100,
 ) -> list[dict]:
     """Get cross-references to specified addresses"""
@@ -470,7 +480,10 @@ def xrefs_to_field(queries: list[StructFieldQuery] | StructFieldQuery) -> list[d
 @tool
 @idasync
 def callees(
-    addrs: Annotated[list[str] | str, "Function addresses to get callees for"],
+    addrs: Annotated[
+        list[str] | str,
+        "函数地址。该函数内调用的目标列表。支持 hex、符号名、逗号分隔。",
+    ],
     limit: Annotated[int, "Max callees per function (default: 200, max: 500)"] = 200,
 ) -> list[dict]:
     """Get functions called by the specified functions"""
@@ -680,7 +693,10 @@ def find_bytes(
 @tool
 @idasync
 def basic_blocks(
-    addrs: Annotated[list[str] | str, "Function addresses to get basic blocks for"],
+    addrs: Annotated[
+        list[str] | str,
+        "函数地址。获取该函数的基本块及控制流。支持 hex、符号名。",
+    ],
     max_blocks: Annotated[
         int, "Max basic blocks per function (default: 1000, max: 10000)"
     ] = 1000,
@@ -1145,18 +1161,21 @@ def _scan_insn_ranges(
 @tool
 @idasync
 def export_funcs(
-    addrs: Annotated[list[str] | str, "Function addresses to export"],
+    addrs: Annotated[
+        list[str] | str,
+        "函数地址或名称。支持 hex、符号名(start/main)。导出为 json/c_header/prototypes。",
+    ],
     format: Annotated[
         str, "Export format: json (default), c_header, or prototypes"
     ] = "json",
 ) -> dict:
-    """Export function data in various formats"""
+    """导出函数数据。format: json(含 asm/code/xrefs)、c_header、prototypes。输入地址或符号名。"""
     addrs = normalize_list_input(addrs)
     results = []
 
     for addr in addrs:
         try:
-            ea = parse_address(addr)
+            ea = parse_address_or_name(addr)
             func = idaapi.get_func(ea)
             if not func:
                 results.append({"addr": addr, "error": "Function not found"})
@@ -1210,7 +1229,8 @@ def export_funcs(
 @idasync
 def callgraph(
     roots: Annotated[
-        list[str] | str, "Root function addresses to start call graph traversal from"
+        list[str] | str,
+        "起始函数地址或名称。从该函数开始遍历调用图。支持 hex、符号名。",
     ],
     max_depth: Annotated[int, "Maximum depth for call graph traversal"] = 5,
     max_nodes: Annotated[
@@ -1237,7 +1257,7 @@ def callgraph(
 
     for root in roots:
         try:
-            ea = parse_address(root)
+            ea = parse_address_or_name(root)
             func = idaapi.get_func(ea)
             if not func:
                 results.append(

@@ -68,6 +68,7 @@ def install_mcp_servers(*, uninstall=False, quiet=False):
     """安装/卸载 MCP 服务器配置"""
     special_json_structures = {
         "VS Code": ("mcp", "servers"),
+        "VS Code Insiders": ("mcp", "servers"),
         "Visual Studio 2022": (None, "servers"),
     }
 
@@ -90,6 +91,7 @@ def install_mcp_servers(*, uninstall=False, quiet=False):
             "Warp": (os.path.join(os.path.expanduser("~"), ".warp"), "mcp_config.json"),
             "Amazon Q": (os.path.join(os.path.expanduser("~"), ".aws", "amazonq"), "mcp_config.json"),
             "VS Code": (os.path.join(os.getenv("APPDATA", ""), "Code", "User"), "settings.json"),
+            "VS Code Insiders": (os.path.join(os.getenv("APPDATA", ""), "Code - Insiders", "User"), "settings.json"),
         }
     elif sys.platform == "darwin":
         configs = {
@@ -111,6 +113,7 @@ def install_mcp_servers(*, uninstall=False, quiet=False):
             "Warp": (os.path.join(os.path.expanduser("~"), ".warp"), "mcp_config.json"),
             "Amazon Q": (os.path.join(os.path.expanduser("~"), ".aws", "amazonq"), "mcp_config.json"),
             "VS Code": (os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Code", "User"), "settings.json"),
+            "VS Code Insiders": (os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Code - Insiders", "User"), "settings.json"),
         }
     elif sys.platform == "linux":
         configs = {
@@ -130,6 +133,7 @@ def install_mcp_servers(*, uninstall=False, quiet=False):
             "Warp": (os.path.join(os.path.expanduser("~"), ".warp"), "mcp_config.json"),
             "Amazon Q": (os.path.join(os.path.expanduser("~"), ".aws", "amazonq"), "mcp_config.json"),
             "VS Code": (os.path.join(os.path.expanduser("~"), ".config", "Code", "User"), "settings.json"),
+            "VS Code Insiders": (os.path.join(os.path.expanduser("~"), ".config", "Code - Insiders", "User"), "settings.json"),
         }
     else:
         print(f"Unsupported platform: {sys.platform}")

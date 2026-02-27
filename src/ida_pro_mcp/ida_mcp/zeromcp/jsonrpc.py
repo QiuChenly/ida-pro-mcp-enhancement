@@ -258,6 +258,16 @@ class JsonRpcRegistry:
 
             validated_params = {}
             for param_name, value in params.items():
+                # Coerce JSON-like strings for any param (MCP clients sometimes stringify
+                # object/array, e.g. regions="[{\"addr\":\"0x401000\"}]" instead of array)
+                if isinstance(value, str):
+                    s = value.strip()
+                    if len(s) > 1 and (s[0] == "{" or s[0] == "["):
+                        try:
+                            value = json.loads(value)
+                        except json.JSONDecodeError:
+                            pass
+
                 # If no type hint, pass through without validation
                 if param_name not in hints:
                     validated_params[param_name] = value
@@ -282,23 +292,6 @@ class JsonRpcRegistry:
                 # Handle Union types (int | str, Optional[int], etc.)
                 if origin in (Union, UnionType):
                     type_matched = False
-
-                    # HACK: Try to parse str as JSON for non-str unions
-                    # 
-                    # When JSON schema says one field is "object", Claude Code
-                    # (and maybe other MCP clients) can't (or won't) detect
-                    # that the field is actually a dict/list. Instead, they
-                    # treat the field as a string containing JSON object.
-                    #
-                    # To work around this, if the expected type is a Union
-                    # that does not include str, and the provided value is
-                    # a str, we try to parse it as JSON first.
-                    if type(str) not in args and isinstance(value, str):
-                        try:
-                            value = json.loads(value)
-                        except json.JSONDecodeError:
-                            pass
-
                     for arg_type in args:
                         if arg_type is type(None):
                             continue

@@ -159,7 +159,7 @@ def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[dict]:
 @tool
 @idasync
 def rename(batch: RenameBatch) -> dict:
-    """Unified rename operation for functions, globals, locals, and stack variables"""
+    """批量重命名: 函数、全局变量、局部变量、栈变量。batch 可为空{}。格式: {func:[{addr,name}], data:[{old,new}], ...}"""
 
     def _normalize_items(items):
         """Convert single item or None to list"""

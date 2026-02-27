@@ -49,8 +49,8 @@ def get_analysis_prompt() -> str | None:
 class MemoryRead(TypedDict):
     """Memory read request"""
 
-    addr: Annotated[str, "Address to read from (hex or decimal)"]
-    size: Annotated[int, "Number of bytes to read"]
+    addr: Annotated[str, "地址，支持 0x401000、401000、符号名"]
+    size: Annotated[int, "读取字节数，如 16"]
 
 
 class MemoryPatch(TypedDict):
@@ -63,8 +63,8 @@ class MemoryPatch(TypedDict):
 class IntRead(TypedDict):
     """Integer read request"""
 
-    addr: Annotated[str, "Address to read from (hex or decimal)"]
-    ty: Annotated[str, "Integer class (i8/u64/i16le/i16be/etc)"]
+    addr: Annotated[str, "地址，hex 或十进制"]
+    ty: Annotated[str, "类型: i8/u8/i16le/i16be/u32le/u64le 等。i=有符号,u=无符号,le/be=字节序"]
 
 
 class IntWrite(TypedDict):
@@ -150,9 +150,9 @@ class StructFieldQuery(TypedDict):
 class ListQuery(TypedDict, total=False):
     """Pagination query for listing operations"""
 
-    filter: Annotated[str, "Optional glob pattern to filter results"]
-    offset: Annotated[int, "Starting index (default: 0)"]
-    count: Annotated[int, "Maximum number of results (default: 50, 0 for all)"]
+    filter: Annotated[str, "glob 过滤，如 main、*init*、空=全部"]
+    offset: Annotated[int, "起始索引，默认 0"]
+    count: Annotated[int, "返回数量，默认 50，0=全部"]
 
 
 class BreakpointOp(TypedDict):
@@ -433,24 +433,71 @@ def get_image_size() -> int:
 
 
 def parse_address(addr: str | int) -> int:
+    """Parse address from int, hex (0x...), decimal, or pure hex string.
+    Strings with 0x prefix or 6+ hex digits (no prefix) are parsed as hex;
+    shorter decimal strings (e.g. 42) stay decimal for compatibility."""
     if isinstance(addr, int):
         return addr
+    s = str(addr).strip()
     try:
-        return int(addr, 0)
+        v = int(s, 0)
+        # int(s,0) treats "401000" as decimal. For RE, "401000" often means 0x401000.
+        # If s is 6+ hex chars (no 0x), prefer hex (common address format)
+        if (
+            not s.startswith(("0x", "0X"))
+            and len(s) >= 6
+            and all(c in "0123456789abcdefABCDEF" for c in s)
+        ):
+            return int("0x" + s, 16)
+        return v
     except ValueError:
-        for ch in addr:
-            if ch not in "0123456789abcdefABCDEF":
-                raise IDAError(f"Failed to parse address: {addr}")
-        raise IDAError(f"Failed to parse address (missing 0x prefix): {addr}")
+        # Pure hex without 0x prefix: auto-prepend 0x
+        if s and all(c in "0123456789abcdefABCDEF" for c in s):
+            return int("0x" + s, 16)
+        raise IDAError(f"Failed to parse address: {addr}")
+
+
+def parse_address_or_name(addr: str | int) -> int:
+    """Parse address or resolve symbol/function name. For decompile/disasm."""
+    try:
+        return parse_address(addr)
+    except IDAError:
+        pass
+    # Try name lookup (function/symbol)
+    s = str(addr).strip()
+    ea = idaapi.get_name_ea(idaapi.BADADDR, s)
+    if ea != idaapi.BADADDR:
+        return ea
+    raise IDAError(f"Failed to parse address or find symbol: {addr}")
 
 
 def normalize_list_input(value: list | str) -> list:
-    """Normalize input to list - accepts list or comma-separated string"""
+    """Normalize input to list - accepts list or comma-separated string. Strips stray quotes from JSON serialization."""
     if isinstance(value, list):
         return value
     if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
+        s = value.strip().strip('"\'')
+        return [item.strip().strip('"\'') for item in s.split(",") if item.strip()]
     return [value]
+
+
+# Regex for "offset:count" shorthand in list queries (e.g. "0:50", "10:20")
+_LIST_QUERY_OFFSET_COUNT_RE = re.compile(r"^\s*(\d+)\s*:\s*(\d+)\s*$")
+
+
+def parse_list_query(s: str) -> dict:
+    """Parse list query string: 'offset:count' → pagination, else → filter.
+
+    Examples:
+        "0:50"   → {"offset": 0, "count": 50, "filter": ""}
+        "10:20"  → {"offset": 10, "count": 20, "filter": ""}
+        "main"   → {"offset": 0, "count": 50, "filter": "main"}
+    """
+    s = s.strip()
+    m = _LIST_QUERY_OFFSET_COUNT_RE.match(s)
+    if m:
+        return {"offset": int(m.group(1)), "count": int(m.group(2)), "filter": ""}
+    return {"offset": 0, "count": 50, "filter": s}
 
 
 def normalize_dict_list(

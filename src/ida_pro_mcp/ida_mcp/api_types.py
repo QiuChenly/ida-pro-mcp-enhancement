@@ -1,3 +1,4 @@
+import fnmatch
 from typing import Annotated
 
 import ida_typeinf
@@ -222,11 +223,22 @@ def read_struct(queries: list[StructRead] | StructRead) -> list[dict]:
     return results
 
 
+def _struct_filter_matches(filter_str: str, type_name: str) -> bool:
+    """Match filter against type name. Supports glob (*?) or substring."""
+    if not type_name:
+        return False
+    f, t = filter_str.lower(), type_name.lower()
+    if "*" in f or "?" in f:
+        return fnmatch.fnmatch(t, f)
+    return f in t
+
+
 @tool
 @idasync
 def search_structs(
     filter: Annotated[
-        str, "Case-insensitive substring to search for in structure names"
+        str,
+        "Case-insensitive search. Use * or ? for glob (e.g. FILE*, *_t). Else substring.",
     ],
 ) -> list[dict]:
     """Search structs"""
@@ -237,7 +249,7 @@ def search_structs(
         tif = ida_typeinf.tinfo_t()
         if tif.get_numbered_type(None, ordinal):
             type_name: str = tif.get_type_name()
-            if type_name and filter.lower() in type_name.lower():
+            if type_name and _struct_filter_matches(filter, type_name):
                 if tif.is_udt():
                     udt_data = ida_typeinf.udt_type_data_t()
                     cardinality = 0
@@ -413,17 +425,23 @@ def infer_types(
             ea = parse_address(addr)
             tif = ida_typeinf.tinfo_t()
 
-            # Try Hex-Rays inference
-            if ida_hexrays.init_hexrays_plugin() and ida_hexrays.guess_tinfo(tif, ea):
-                results.append(
-                    {
-                        "addr": addr,
-                        "inferred_type": str(tif),
-                        "method": "hexrays",
-                        "confidence": "high",
-                    }
-                )
-                continue
+            # Try Hex-Rays inference (not available in Hopper/non-IDA environments)
+            if ida_hexrays.init_hexrays_plugin() and hasattr(
+                ida_hexrays, "guess_tinfo"
+            ):
+                try:
+                    if ida_hexrays.guess_tinfo(tif, ea):
+                        results.append(
+                            {
+                                "addr": addr,
+                                "inferred_type": str(tif),
+                                "method": "hexrays",
+                                "confidence": "high",
+                            }
+                        )
+                        continue
+                except Exception:
+                    pass  # Fall through to other methods
 
             # Try getting existing type info
             if ida_nalt.get_tinfo(tif, ea):
@@ -457,23 +475,31 @@ def infer_types(
                 )
                 continue
 
+            # No type could be inferred
+            hint = None
+            if not hasattr(ida_hexrays, "guess_tinfo"):
+                hint = "Hex-Rays type inference unavailable (e.g. Hopper or IDA Free)"
             results.append(
                 {
                     "addr": addr,
                     "inferred_type": None,
                     "method": None,
                     "confidence": "none",
+                    "error": hint,
                 }
             )
 
         except Exception as e:
+            err_msg = str(e)
+            if "guess_tinfo" in err_msg or "ida_hexrays" in err_msg.lower():
+                err_msg = f"{err_msg} (Hex-Rays may be unavailable)"
             results.append(
                 {
                     "addr": addr,
                     "inferred_type": None,
                     "method": None,
                     "confidence": "none",
-                    "error": str(e),
+                    "error": err_msg,
                 }
             )
 

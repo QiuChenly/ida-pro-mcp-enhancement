@@ -20,12 +20,12 @@ SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 if __name__ == "__main__" or __package__ is None:
     sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
     from ida_pro_mcp.http_server import IDAHttpServer, REGISTRY
-    from ida_pro_mcp.tool_registry import parse_all_api_files, ToolDef
+    from ida_pro_mcp.tool_registry import parse_all_api_files, tool_to_mcp_schema, ToolDef
     from ida_pro_mcp.install import install_ida_plugin, install_mcp_servers, print_mcp_config
     from ida_pro_mcp.broker_client import BrokerClient
 else:
     from .http_server import IDAHttpServer, REGISTRY
-    from .tool_registry import parse_all_api_files, ToolDef
+    from .tool_registry import parse_all_api_files, tool_to_mcp_schema, ToolDef
     from .install import install_ida_plugin, install_mcp_servers, print_mcp_config
     from .broker_client import BrokerClient
 
@@ -89,13 +89,13 @@ def _broker():
 # 注册实例管理工具（通过 Broker 客户端，无需本地 REGISTRY）
 @mcp.tool
 def instance_list() -> list[dict]:
-    """列出所有已连接的 IDA 实例。本地工具，无需 IDA 连接。"""
+    """列出所有已连接的 IDA/Hopper 实例。无需加载 IDB。返回 instance_id,name,binary_path,base_addr。用于多实例切换。"""
     return _broker().list_instances()
 
 
 @mcp.tool
 def instance_current() -> dict:
-    """获取当前活动 IDA 实例的信息。本地工具，无需 IDA 连接。"""
+    """获取当前活动实例信息。返回 instance_id,name,binary_path,base_addr,file_type。调用其他工具前建议先确认。"""
     out = _broker().get_current()
     if out is None:
         return {"error": "Broker 不可用。请先启动: ida-pro-mcp --broker"}
@@ -106,13 +106,13 @@ def instance_current() -> dict:
 
 @mcp.tool
 def instance_switch(instance_id: str) -> dict:
-    """切换到指定的 IDA 实例。本地工具，无需 IDA 连接。"""
+    """切换到指定实例。instance_id 来自 instance_list 返回。切换后后续 MCP 调用将发往该实例。"""
     return _broker().set_current(instance_id)
 
 
 @mcp.tool
 def instance_info(instance_id: str) -> dict:
-    """获取指定 IDA 实例的详细信息。本地工具，无需 IDA 连接。"""
+    """获取指定实例详情。instance_id 来自 instance_list。返回 binary_path,base_addr,processor 等。"""
     instances = _broker().list_instances()
     current = _broker().get_current()
     current_id = (current or {}).get("instance_id")
@@ -128,6 +128,7 @@ def instance_info(instance_id: str) -> dict:
 
 _IDA_API_DIR = os.path.join(SCRIPT_DIR, "ida_mcp")
 _IDA_TOOLS, _IDA_RESOURCES = parse_all_api_files(_IDA_API_DIR)
+_IDA_TOOL_SCHEMAS = {t.name: tool_to_mcp_schema(t) for t in _IDA_TOOLS}
 
 UNSAFE_TOOLS = {t.name for t in _IDA_TOOLS if t.is_unsafe}
 IDA_TOOLS: set[str] = set()
@@ -240,10 +241,13 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
         
         return dispatch_original(request)
     
-    # tools/list - 返回所有工具
+    # tools/list - 返回所有工具，用预计算的正确 schema 替换 IDA 工具
     if method == "tools/list":
         response = dispatch_original(request)
         tools = response.get("result", {}).get("tools", []) if response else []
+        for i, tool in enumerate(tools):
+            if tool.get("name") in _IDA_TOOL_SCHEMAS:
+                tools[i] = _IDA_TOOL_SCHEMAS[tool["name"]]
         current = _broker().get_current()
         if current and not current.get("error"):
             print(f"[MCP] tools/list: {len(tools)} 个工具 (IDA: {current.get('name', '')})", file=sys.stderr)

@@ -4,11 +4,13 @@ This module provides batch operations for reading and writing memory at various
 granularities (bytes, integers, strings) and patching binary data.
 """
 
+import json
 import re
 
 from typing import Annotated
 import ida_bytes
 import idaapi
+import idc
 
 from .rpc import tool
 from .sync import idasync
@@ -27,12 +29,58 @@ from .utils import (
 # ============================================================================
 
 
+def _strip_quotes(s: str) -> str:
+    """Remove surrounding quotes (matched or stray) left by JSON/string serialization."""
+    s = s.strip().strip('"\'')
+    return s.strip()
+
+
+def _parse_region_str(s: str) -> MemoryRead:
+    """Parse 'addr:size' string to MemoryRead dict (e.g. '0x401000:16'). Tolerates surrounding quotes."""
+    s = _strip_quotes(s.strip())
+    if ":" in s:
+        addr_part, size_part = s.split(":", 1)
+        addr_part = _strip_quotes(addr_part)
+        size_part = _strip_quotes(size_part)
+        return {
+            "addr": addr_part,
+            "size": int(size_part, 0),
+        }
+    raise ValueError(f"Expected 'addr:size' format, got: {s}")
+
+
+def _normalize_regions(regions: list[MemoryRead] | MemoryRead | str) -> list[MemoryRead]:
+    """Normalize regions to list[MemoryRead]. Accepts dict, list[dict], str 'addr:size', or JSON string '[{addr,size}]'."""
+    if isinstance(regions, dict):
+        return [regions]
+    if isinstance(regions, str):
+        s = regions.strip().strip('"\'')
+        if len(s) > 1 and (s[0] == "{" or s[0] == "["):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, dict):
+                    return [parsed]
+                if isinstance(parsed, list):
+                    return parsed
+            except (json.JSONDecodeError, ValueError):
+                pass
+        parts = [p.strip().strip('"\'') for p in s.split(",") if p.strip()]
+        return [_parse_region_str(p) for p in parts]
+    return regions if isinstance(regions, list) else []
+
+
 @tool
 @idasync
-def get_bytes(regions: list[MemoryRead] | MemoryRead) -> list[dict]:
-    """Read bytes from memory addresses"""
-    if isinstance(regions, dict):
-        regions = [regions]
+def get_bytes(
+    regions: Annotated[
+        list[MemoryRead] | MemoryRead | str,
+        "内存区域。格式: {addr,size}、数组、或字符串'addr:size'(例'0x401000:16'、'0x401000:16, 0x402000:8')。",
+    ],
+) -> list[dict]:
+    """从内存读取原始字节。输入格式: 对象{addr,size}、数组、或字符串'addr:size'(例'0x401000:16'、'0x401000:16, 0x402000:8')。返回 addr,data(hex)。"""
+    regions = _normalize_regions(regions)
+    if not regions:
+        return []
 
     results = []
     for item in regions:
@@ -90,10 +138,10 @@ def _parse_int_value(text: str, signed: bool, bits: int) -> int:
 def get_int(
     queries: Annotated[
         list[IntRead] | IntRead,
-        "Integer read requests (ty, addr). ty: i8/u64/i16le/i16be/etc",
+        "整数读取: {addr,ty}。ty 格式: i8/u8/i16le/i16be/u32le/u64。例: {addr:'0x401000',ty:'u32le'}",
     ],
 ) -> list[dict]:
-    """Read integer values from memory addresses"""
+    """从指定地址按类型读整数。支持有符号(i)无符号(u)、8/16/32/64位、大小端(le/be)。返回 addr,ty,value。"""
     if isinstance(queries, dict):
         queries = [queries]
 
@@ -123,9 +171,12 @@ def get_int(
 @tool
 @idasync
 def get_string(
-    addrs: Annotated[list[str] | str, "Addresses to read strings from"],
+    addrs: Annotated[
+        list[str] | str,
+        "地址，支持 hex/十进制/逗号分隔。例: '0x403000' 或 '0x403000, 0x403010'",
+    ],
 ) -> list[dict]:
-    """Read strings from memory addresses"""
+    """从地址读取 IDA 识别的字符串(C/宽字符)。返回 addr,value。若该址无字符串则 error。"""
     addrs = normalize_list_input(addrs)
     results = []
 
@@ -159,7 +210,19 @@ def get_global_variable_value_internal(ea: int) -> str:
 
         size = ida_bytes.get_item_size(ea)
         if size == 0:
-            raise IDAError(f"Failed to get type information for variable at {ea:#x}")
+            # Fallback: try idc.get_item_size or read 4 bytes for typical int/bool
+            try:
+                size = idc.get_item_size(ea)
+            except Exception:
+                size = 0
+            if size == 0:
+                # Last resort: assume 4-byte scalar (int32/bool), common for globals
+                try:
+                    return hex(ida_bytes.get_dword(ea))
+                except Exception:
+                    raise IDAError(
+                        f"No type info at {ea:#x}. Use get_bytes with explicit size to read raw bytes."
+                    )
     else:
         size = tif.get_size()
 
@@ -185,11 +248,11 @@ def get_global_variable_value_internal(ea: int) -> str:
 @idasync
 def get_global_value(
     queries: Annotated[
-        list[str] | str, "Global variable addresses or names to read values from"
+        list[str] | str,
+        "全局变量地址或名称。例: '0x403000'、'globalVar'、'isDemoVersion'。按类型解析返回值。",
     ],
 ) -> list[dict]:
-    """Read global variable values by address or name
-    (auto-detects hex addresses vs names)"""
+    """按地址或符号名读取全局变量值。自动识别 hex 地址 vs 名称。需 IDA 已定义该全局类型。"""
     from .utils import looks_like_address
 
     queries = normalize_list_input(queries)

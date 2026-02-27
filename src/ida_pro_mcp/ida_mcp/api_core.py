@@ -47,6 +47,7 @@ from .utils import (
     ListQuery,
     normalize_list_input,
     normalize_dict_list,
+    parse_list_query,
     get_function,
     paginate,
     pattern_filter,
@@ -82,9 +83,12 @@ def _parse_func_query(query: str) -> int:
 @tool
 @idasync
 def lookup_funcs(
-    queries: Annotated[list[str] | str, "Address(es) or name(s)"],
+    queries: Annotated[
+        list[str] | str,
+        "函数地址或名称，支持: hex(0x401000)、十进制、sub_401000、符号名(main/start)。可传字符串、逗号分隔串或数组。示例: 'main'、'0x401000, start'",
+    ],
 ) -> list[dict]:
-    """Get functions by address or name (auto-detects)"""
+    """按地址或名称查找函数。输入: 地址(0x401000/401000/sub_401000)或符号名(main,start)。输出: addr,name,size。支持批量。"""
     queries = normalize_list_input(queries)
 
     # Treat empty/"*" as "all functions" - but add limit
@@ -125,11 +129,11 @@ def lookup_funcs(
 @tool
 def int_convert(
     inputs: Annotated[
-        list[NumberConversion] | NumberConversion,
-        "Convert numbers to various formats (hex, decimal, binary, ascii)",
+        list[NumberConversion] | NumberConversion | str,
+        "要转换的数: 字符串'0x41'/'255'、数组['0x41','255']、对象{'text':'0x1000','size':32}。输出 decimal/hex/ascii/binary。LLM 切勿自行做进制转换，请用此工具。",
     ],
 ) -> list[dict]:
-    """Convert numbers to different formats"""
+    """数值进制转换。输入任意格式数(0x/十进制)，输出 decimal/hex/ascii/binary。禁止 LLM 手算进制，必须调用此工具。"""
     inputs = normalize_dict_list(inputs, lambda s: {"text": s, "size": 64})
 
     results = []
@@ -196,13 +200,11 @@ def int_convert(
 def list_funcs(
     queries: Annotated[
         list[ListQuery] | ListQuery | str,
-        "List functions with optional filtering and pagination",
+        "查询: glob过滤'main'、分页简写'0:50'(表示从第0个起取50个，非地址范围)、对象{filter,offset,count}。",
     ],
 ) -> list[Page[Function]]:
-    """List functions"""
-    queries = normalize_dict_list(
-        queries, lambda s: {"offset": 0, "count": 50, "filter": s}
-    )
+    """列出函数。支持 glob 过滤、分页。'0:50'=offset:count（列表索引，非地址）。"""
+    queries = normalize_dict_list(queries, parse_list_query)
     all_functions = [get_function(addr) for addr in idautils.Functions()]
 
     results = []
@@ -226,13 +228,11 @@ def list_funcs(
 def list_globals(
     queries: Annotated[
         list[ListQuery] | ListQuery | str,
-        "List global variables with optional filtering and pagination",
+        "查询: glob'g_'、分页'0:20'(offset:count 列表索引，非地址)、对象{filter,offset,count}。",
     ],
 ) -> list[Page[Global]]:
-    """List globals"""
-    queries = normalize_dict_list(
-        queries, lambda s: {"offset": 0, "count": 50, "filter": s}
-    )
+    """列出全局变量。支持 glob 过滤、分页。'0:20'=offset:count（列表索引，非地址）。"""
+    queries = normalize_dict_list(queries, parse_list_query)
     all_globals: list[Global] = []
     for addr, name in idautils.Names():
         if not idaapi.get_func(addr) and name is not None:
@@ -257,10 +257,10 @@ def list_globals(
 @tool
 @idasync
 def imports(
-    offset: Annotated[int, "Offset"],
-    count: Annotated[int, "Count (0=all)"],
+    offset: Annotated[int, "起始索引，从 0 开始"],
+    count: Annotated[int, "返回数量，0 表示全部"],
 ) -> Page[Import]:
-    """List imports"""
+    """列出导入表。返回 addr, imported_name, module。用于查动态链接/API 调用。"""
     nimps = ida_nalt.get_import_module_qty()
 
     rv = []
@@ -286,11 +286,11 @@ def imports(
 @tool
 @idasync
 def find_regex(
-    pattern: Annotated[str, "Regex pattern to search for in strings"],
+    pattern: Annotated[str, "正则表达式，在 IDA 识别的字符串中搜索。例: 'error|fail'、'password'"],
     limit: Annotated[int, "Max matches (default: 30, max: 500)"] = 30,
     offset: Annotated[int, "Skip first N matches (default: 0)"] = 0,
 ) -> dict:
-    """Search strings with case-insensitive regex patterns"""
+    """在二进制字符串中按正则搜索。返回 addr,string。不区分大小写。用于找硬编码字符串。"""
     if limit <= 0:
         limit = 30
     if limit > 500:

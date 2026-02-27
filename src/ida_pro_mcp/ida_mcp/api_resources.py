@@ -6,6 +6,7 @@ Use tools for actions that modify state or perform expensive computations.
 
 from typing import Annotated
 
+import ida_entry
 import ida_funcs
 import ida_nalt
 import ida_segment
@@ -95,16 +96,34 @@ def idb_segments_resource() -> list[Segment]:
     return segments
 
 
+def _get_entry_points() -> list[tuple[int, int, str]]:
+    """Get entry points using ida_entry or idc fallback (compatibility)."""
+    try:
+        entry_count = ida_entry.get_entry_qty()
+        get_ordinal = ida_entry.get_entry_ordinal
+        get_entry = ida_entry.get_entry
+        get_name = ida_entry.get_entry_name
+    except AttributeError:
+        entry_count = idc.get_entry_qty()
+        get_ordinal = idc.get_entry_ordinal
+        get_entry = idc.get_entry
+        get_name = idc.get_entry_name
+
+    result = []
+    for i in range(entry_count):
+        ordinal = get_ordinal(i)
+        ea = get_entry(ordinal)
+        name = get_name(ordinal)
+        result.append((ordinal, ea, name))
+    return result
+
+
 @resource("ida://idb/entrypoints")
 @idasync
 def idb_entrypoints_resource() -> list[dict]:
     """Get entry points (main, TLS callbacks, etc.)"""
     entrypoints = []
-    entry_count = ida_nalt.get_entry_qty()
-    for i in range(entry_count):
-        ordinal = ida_nalt.get_entry_ordinal(i)
-        ea = ida_nalt.get_entry(ordinal)
-        name = ida_nalt.get_entry_name(ordinal)
+    for ordinal, ea, name in _get_entry_points():
         entrypoints.append({"addr": hex(ea), "name": name, "ordinal": ordinal})
     return entrypoints
 
@@ -258,12 +277,7 @@ def import_name_resource(name: Annotated[str, "Import name"]) -> dict:
 @idasync
 def export_name_resource(name: Annotated[str, "Export name"]) -> dict:
     """Get specific export details by name"""
-    entry_count = ida_nalt.get_entry_qty()
-    for i in range(entry_count):
-        ordinal = ida_nalt.get_entry_ordinal(i)
-        ea = ida_nalt.get_entry(ordinal)
-        entry_name = ida_nalt.get_entry_name(ordinal)
-
+    for ordinal, ea, entry_name in _get_entry_points():
         if entry_name == name:
             return {
                 "addr": hex(ea),
