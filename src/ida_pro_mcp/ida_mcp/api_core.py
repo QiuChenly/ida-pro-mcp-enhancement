@@ -84,12 +84,17 @@ def _parse_func_query(query: str) -> int:
 @idasync
 def lookup_funcs(
     queries: Annotated[
-        list[str] | str,
-        "函数地址或名称，支持: hex(0x401000)、十进制、sub_401000、符号名(main/start)。可传字符串、逗号分隔串或数组。示例: 'main'、'0x401000, start'",
+        list[str] | list[dict] | str,
+        "函数地址或名称。支持: 字符串'0x401000'、逗号分隔'main, start'、数组['0x401000','main']、或对象数组[{'addr':'0x401000'}]。",
     ],
 ) -> list[dict]:
-    """按地址或名称查找函数。输入: 地址(0x401000/401000/sub_401000)或符号名(main,start)。输出: addr,name,size。支持批量。"""
-    queries = normalize_list_input(queries)
+    """按地址或名称查找函数。输入: 地址(0x401000/sub_401000)或符号名(main,start)。输出: addr,name,size。支持批量。"""
+    raw = normalize_list_input(queries) if isinstance(queries, (list, str)) else [queries]
+    # 支持 [{"addr": "0x401000"}, ...] 格式，统一转为字符串列表
+    queries = [
+        (q.get("addr") or q.get("name") or str(q)) if isinstance(q, dict) else str(q)
+        for q in raw
+    ]
 
     # Treat empty/"*" as "all functions" - but add limit
     if not queries or (len(queries) == 1 and queries[0] in ("*", "")):

@@ -96,9 +96,30 @@ class TypedDictParser(ast.NodeVisitor):
                 return False
         return True
 
+    def _collect_union_members(self, node: ast.expr) -> list[ast.expr]:
+        """Flatten Union (a | b | c) to list of type nodes."""
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            return self._collect_union_members(node.left) + self._collect_union_members(
+                node.right
+            )
+        return [node]
+
     def _type_node_to_schema(self, node: ast.expr) -> dict | None:
         if isinstance(node, ast.Name):
             return self._simple_type_to_schema(node.id)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            members = self._collect_union_members(node)
+            schemas = []
+            for m in members:
+                if isinstance(m, ast.Name) and m.id in ("None", "NoneType"):
+                    continue
+                s = self._type_node_to_schema(m)
+                if s and s not in schemas:
+                    schemas.append(s)
+            if len(schemas) == 1:
+                return schemas[0]
+            if schemas:
+                return {"anyOf": schemas}
         if isinstance(node, ast.Subscript):
             if isinstance(node.value, ast.Name):
                 if node.value.id == "list":
@@ -114,6 +135,8 @@ class TypedDictParser(ast.NodeVisitor):
         m = {"str": "string", "int": "integer", "float": "number", "bool": "boolean"}
         if name in m:
             return {"type": m[name]}
+        if name in self.registry:
+            return dict(self.registry[name])
         return {"type": "object"}
 
 
