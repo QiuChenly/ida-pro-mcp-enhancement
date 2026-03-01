@@ -55,7 +55,7 @@ Install the latest version of the IDA Pro MCP package:
 
 ```sh
 pip uninstall ida-pro-mcp
-pip install https://github.com/mrexodia/ida-pro-mcp/archive/refs/heads/main.zip
+pip install https://github.com/QiuChenly/ida-pro-mcp-enhancement/archive/refs/heads/main.zip
 ```
 
 Configure the MCP servers and install the IDA Plugin:
@@ -430,7 +430,7 @@ git log --first-parent --no-merges 1.2.0..main "--pretty=- %s"
 
 ```sh
 pip uninstall ida-pro-mcp
-pip install https://github.com/mrexodia/ida-pro-mcp/archive/refs/heads/main.zip
+pip install https://github.com/QiuChenly/ida-pro-mcp-enhancement/archive/refs/heads/main.zip
 ```
 
 或本地开发安装：
