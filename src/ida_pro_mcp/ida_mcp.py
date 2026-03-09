@@ -146,7 +146,14 @@ class MCP(idaapi.plugin_t):
 
         def handle_mcp_request(request: dict) -> dict:
             """处理来自服务器的 MCP 请求"""
-            return MCP_SERVER.registry.dispatch(request)
+            out = MCP_SERVER.registry.dispatch(request)
+            if out is None:
+                return {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32603, "message": "Internal error"},
+                    "id": request.get("id"),
+                }
+            return out
 
         if not silent:
             print("[MCP] 正在连接到 MCP 服务器...")

@@ -13,7 +13,7 @@ import json
 import argparse
 import threading
 import time
-from typing import Optional, BinaryIO
+from typing import Optional, BinaryIO, cast
 
 # 处理直接运行和作为包运行两种情况
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -197,27 +197,33 @@ def _register_ida_resources():
 # 请求路由
 # ============================================================================
 
-def route_to_ida(request: dict) -> Optional[dict]:
+def route_to_ida(request: dict) -> JsonRpcResponse | None:
     """将请求路由到当前 IDA 实例（通过 Broker）"""
     if not _broker().has_instances():
-        return {
-            "jsonrpc": "2.0",
-            "error": {
-                "code": -32000,
-                "message": "没有活动的 IDA 实例。请启动 IDA 并按 Ctrl+Alt+M 连接。",
+        return cast(
+            JsonRpcResponse,
+            {
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32000,
+                    "message": "没有活动的 IDA 实例。请启动 IDA 并按 Ctrl+Alt+M 连接。",
+                },
+                "id": request.get("id"),
             },
-            "id": request.get("id"),
-        }
+        )
     current = _broker().get_current()
     instance_id = (current or {}).get("instance_id") if current and not current.get("error") else None
     response = _broker().send_request(request, instance_id)
     if response is None:
-        return {
-            "jsonrpc": "2.0",
-            "error": {"code": -32000, "message": "IDA 请求超时"},
-            "id": request.get("id"),
-        }
-    return response
+        return cast(
+            JsonRpcResponse,
+            {
+                "jsonrpc": "2.0",
+                "error": {"code": -32000, "message": "IDA 请求超时"},
+                "id": request.get("id"),
+            },
+        )
+    return cast(JsonRpcResponse, response)
 
 
 def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
@@ -262,7 +268,10 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
         return dispatch_original(request)
     if method == "resources/read":
         if not _broker().has_instances():
-            return {"jsonrpc": "2.0", "result": {"contents": []}, "id": request.get("id")}
+            return cast(
+                JsonRpcResponse,
+                {"jsonrpc": "2.0", "result": {"contents": []}, "id": request.get("id")},
+            )
         return route_to_ida(request)
     
     # prompts 相关
