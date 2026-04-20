@@ -25,6 +25,7 @@ class IDAInstance:
     instance_type: str = "gui"
     name: str = ""
     binary_path: str = ""
+    idb_path: str = ""
     arch_info: dict = field(default_factory=dict)
     connected_at: datetime = field(default_factory=datetime.now)
     
@@ -35,6 +36,7 @@ class IDAInstance:
             "type": self.instance_type,
             "name": self.name,
             "binary_path": self.binary_path,
+            "idb_path": self.idb_path,
         }
         if self.arch_info:
             result["processor"] = self.arch_info.get("processor", "")
@@ -50,7 +52,6 @@ class IDARegistry:
     
     def __init__(self):
         self._instances: dict[str, IDAInstance] = {}
-        self._current_client_id: Optional[str] = None
         self._lock = threading.RLock()
         
         # SSE 队列：client_id -> Queue
@@ -72,26 +73,25 @@ class IDARegistry:
                 if old_inst.instance_id == instance_id:
                     self._instances.pop(old_client_id, None)
                     self._sse_queues.pop(old_client_id, None)
-                    if self._current_client_id == old_client_id:
-                        self._current_client_id = None
                     print(f"[HTTP] 替换旧连接: {old_inst.name or instance_id} ({old_client_id})", file=sys.stderr)
                     sys.stderr.flush()
                     break
 
             client_id = str(uuid.uuid4())[:8]
+            arch_info = data.get("arch_info", {}) or {}
+            # idb_path 优先顶层字段，兼容从 arch_info 传入（插件端为减少上游改动时会放这里）
+            idb_path = data.get("idb_path", "") or arch_info.get("idb_path", "")
             instance = IDAInstance(
                 client_id=client_id,
                 instance_id=instance_id or client_id,
                 instance_type=data.get("instance_type", "gui"),
                 name=data.get("name", ""),
                 binary_path=data.get("binary_path", ""),
-                arch_info=data.get("arch_info", {}),
+                idb_path=idb_path,
+                arch_info=arch_info,
             )
             self._instances[client_id] = instance
             self._sse_queues[client_id] = queue.Queue()
-
-            if self._current_client_id is None:
-                self._current_client_id = client_id
 
             print(f"[HTTP] +++ IDA 已连接: {instance.name or instance.instance_id} +++", file=sys.stderr)
             sys.stderr.flush()
@@ -113,16 +113,6 @@ class IDARegistry:
                 
                 if self._on_disconnect:
                     self._on_disconnect(instance.instance_id)
-            
-            if self._current_client_id == client_id:
-                self._current_client_id = next(iter(self._instances), None)
-    
-    def get_current(self) -> Optional[IDAInstance]:
-        """获取当前实例"""
-        with self._lock:
-            if self._current_client_id:
-                return self._instances.get(self._current_client_id)
-            return None
     
     def get_by_client_id(self, client_id: str) -> Optional[IDAInstance]:
         """根据 client_id 获取实例"""
@@ -137,22 +127,10 @@ class IDARegistry:
                     return inst
             return None
     
-    def set_current(self, instance_id: str) -> bool:
-        """设置当前实例"""
-        with self._lock:
-            for client_id, inst in self._instances.items():
-                if inst.instance_id == instance_id:
-                    self._current_client_id = client_id
-                    return True
-            return False
-    
     def list_all(self) -> list[dict]:
         """列出所有实例"""
         with self._lock:
-            return [
-                {**inst.to_dict(), "is_current": inst.client_id == self._current_client_id}
-                for inst in self._instances.values()
-            ]
+            return [inst.to_dict() for inst in self._instances.values()]
     
     def has_instances(self) -> bool:
         """是否有实例"""
@@ -166,10 +144,22 @@ class IDARegistry:
             if instance_id:
                 inst = self.get_by_instance_id(instance_id)
             else:
-                inst = self.get_current()
+                # 如果未指定且只有一个实例，自动路由；否则报错返回
+                if len(self._instances) == 1:
+                    inst = next(iter(self._instances.values()))
+                else:
+                    return {
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32602, "message": "存在多个 IDA 实例或未指定 instance_id，无法路由。"},
+                        "id": request.get("id")
+                    }
             
             if not inst:
-                return None
+                return {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32000, "message": f"找不到目标实例: {instance_id}"},
+                    "id": request.get("id")
+                }
             
             client_id = inst.client_id
             sse_queue = self._sse_queues.get(client_id)
@@ -258,8 +248,6 @@ class IDARequestHandler(BaseHTTPRequestHandler):
             self._handle_unregister()
         elif path == "/response":
             self._handle_response()
-        elif path == "/api/current":
-            self._handle_api_current_set()
         elif path == "/api/request":
             self._handle_api_request()
         else:
@@ -281,8 +269,6 @@ class IDARequestHandler(BaseHTTPRequestHandler):
             self._send_json({"instances": REGISTRY.list_all()})
         elif path == "/api/instances":
             self._send_json(REGISTRY.list_all())
-        elif path == "/api/current":
-            self._handle_api_current_get()
         else:
             self._send_json({"error": "Not found"}, 404)
     
@@ -328,34 +314,6 @@ class IDARequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
         else:
             self._send_json({"error": "Missing request_id or response"}, 400)
-    
-    def _handle_api_current_get(self):
-        """GET /api/current - 返回当前实例信息（供 MCP 客户端调用）"""
-        instance = REGISTRY.get_current()
-        if instance is None:
-            self._send_json({"error": "没有活动的 IDA 实例。请启动 IDA 并按 Ctrl+Alt+M 连接。"})
-            return
-        self._send_json({**instance.to_dict(), "is_current": True})
-    
-    def _handle_api_current_set(self):
-        """POST /api/current - 设置当前实例（供 MCP 客户端调用）"""
-        data = self._read_json()
-        if data is None:
-            self._send_json({"error": "Invalid JSON"}, 400)
-            return
-        instance_id = data.get("instance_id")
-        if not instance_id:
-            self._send_json({"success": False, "error": "Missing instance_id"}, 400)
-            return
-        if REGISTRY.set_current(instance_id):
-            instance = REGISTRY.get_by_instance_id(instance_id)
-            self._send_json({
-                "success": True,
-                "message": f"已切换到实例: {instance_id}",
-                "instance": instance.to_dict() if instance else None,
-            })
-        else:
-            self._send_json({"success": False, "error": f"实例不存在: {instance_id}"})
     
     def _handle_api_request(self):
         """POST /api/request - 转发 MCP 请求到 IDA 并返回响应（供 MCP 客户端调用）"""

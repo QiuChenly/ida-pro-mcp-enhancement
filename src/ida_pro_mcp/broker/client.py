@@ -47,15 +47,6 @@ class BrokerClient:
         out = self._request("GET", "/api/instances")
         return out if isinstance(out, list) else []
 
-    def get_current(self) -> Optional[dict]:
-        """GET /api/current"""
-        return self._request("GET", "/api/current")
-
-    def set_current(self, instance_id: str) -> dict:
-        """POST /api/current"""
-        out = self._request("POST", "/api/current", {"instance_id": instance_id})
-        return out if isinstance(out, dict) else {"success": False, "error": "Broker 无响应"}
-
     def send_request(
         self,
         request: dict,

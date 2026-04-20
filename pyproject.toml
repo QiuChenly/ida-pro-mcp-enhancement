@@ -36,6 +36,14 @@ Issues = "https://github.com/mrexodia/ida-pro-mcp/issues"
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
+# uv 工具配置
+# 本项目通常位于外部卷 (如 /Volumes/...)，与 uv 默认缓存目录 (~/.cache/uv)
+# 不在同一文件系统上，APFS clonefile() / reflink 在跨卷场景下会自动回退到
+# full copy 并输出 warning。这里显式声明 copy 模式，消除 warning 并让
+# 安装行为在不同机器上保持一致。
+[tool.uv]
+link-mode = "copy"
+
 [project.scripts]
 ida-pro-mcp = "ida_pro_mcp.server:main"
 idalib-mcp = "ida_pro_mcp.idalib_server:main"

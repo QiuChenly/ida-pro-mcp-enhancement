@@ -15,6 +15,9 @@ import tomli_w
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 IDA_PLUGIN_PKG = os.path.join(SCRIPT_DIR, "ida_mcp")
 IDA_PLUGIN_LOADER = os.path.join(SCRIPT_DIR, "ida_mcp.py")
+# broker/ 内含 SQLite 静态缓存守护线程、查询、拦截器、类型声明等纯代码文件，
+# 在 IDA 插件进程里同样需要，所以和 ida_mcp/ 一起铺到 IDA plugins 目录。
+IDA_BROKER_PKG = os.path.join(SCRIPT_DIR, "broker")
 
 
 def get_python_executable():
@@ -238,9 +241,10 @@ def install_ida_plugin(*, uninstall=False, quiet=False, allow_ida_free=False):
     ida_plugin_folder = os.path.join(ida_folder, "plugins")
     loader_dest = os.path.join(ida_plugin_folder, "ida_mcp.py")
     pkg_dest = os.path.join(ida_plugin_folder, "ida_mcp")
+    broker_dest = os.path.join(ida_plugin_folder, "broker")
 
     if uninstall:
-        for path in [loader_dest, pkg_dest]:
+        for path in [loader_dest, pkg_dest, broker_dest]:
             if os.path.lexists(path):
                 if os.path.isdir(path) and not os.path.islink(path):
                     shutil.rmtree(path)
@@ -250,8 +254,12 @@ def install_ida_plugin(*, uninstall=False, quiet=False, allow_ida_free=False):
                     print(f"Removed: {path}")
     else:
         os.makedirs(ida_plugin_folder, exist_ok=True)
-        
-        for src, dest in [(IDA_PLUGIN_LOADER, loader_dest), (IDA_PLUGIN_PKG, pkg_dest)]:
+
+        for src, dest in [
+            (IDA_PLUGIN_LOADER, loader_dest),
+            (IDA_PLUGIN_PKG, pkg_dest),
+            (IDA_BROKER_PKG, broker_dest),
+        ]:
             if os.path.lexists(dest):
                 if os.path.isdir(dest) and not os.path.islink(dest):
                     shutil.rmtree(dest)

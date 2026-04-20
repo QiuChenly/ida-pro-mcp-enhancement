@@ -472,6 +472,13 @@ def tool_to_mcp_schema(tool: ToolDef) -> dict:
         
         if param.required:
             required.append(param.name)
+            
+    # 强制注入 instance_id 用于无缝路由
+    properties["instance_id"] = {
+        "type": "string",
+        "description": "必须提供的 instance_id（或 client_id），用于将请求精确路由到特定的 IDA 实例。请先调用 instance_list 查看并选择合适的客户端 ID。"
+    }
+    required.append("instance_id")
     
     schema = {
         "name": tool.name,

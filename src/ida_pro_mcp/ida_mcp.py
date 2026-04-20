@@ -39,6 +39,14 @@ def _get_current_binary_path() -> str:
         return ""
 
 
+def _get_current_idb_path() -> str:
+    """获取当前 IDB 数据库路径（.idb/.i64）。用于在旁路生成 SQLite 缓存文件。"""
+    try:
+        return idc.get_idb_path() or ""
+    except Exception:
+        return ""
+
+
 def _get_current_binary_name() -> str:
     """获取当前打开的二进制文件名"""
     path = _get_current_binary_path()
@@ -90,6 +98,7 @@ class MCP(idaapi.plugin_t):
         self._connecting = False  # 正在连接中标志，防止重复连接
         self._mcp_server = None
         self._auto_connect_tried = False
+        self._idb_path_for_cache = ""
 
         def auto_connect_timer():
             if not self._auto_connect_tried:
@@ -142,10 +151,47 @@ class MCP(idaapi.plugin_t):
         instance_id = _generate_instance_id()
         binary_path = _get_current_binary_path()
         binary_name = _get_current_binary_name()
+        idb_path = _get_current_idb_path()
         arch_info = _get_arch_info()
+        # 将 idb_path 塞入 arch_info，注册到 Broker 后外部即可定位 .mcp.sqlite 缓存文件。
+        if idb_path:
+            arch_info["idb_path"] = idb_path
+
+        # 启动 SQLite 静态缓存后台守护线程（实现位于 broker 子目录，按 IDA 插件加载惯例走绝对 import）
+        if idb_path:
+            try:
+                if TYPE_CHECKING:
+                    from .broker import sqlite_cache as _mcp_sqlite_cache
+                else:
+                    from broker import sqlite_cache as _mcp_sqlite_cache
+                _mcp_sqlite_cache.start_cache_daemon(idb_path)
+                self._idb_path_for_cache = idb_path
+            except Exception as _e:
+                print(f"[MCP] SQLite 缓存守护线程启动失败: {_e}")
+                self._idb_path_for_cache = ""
+        else:
+            self._idb_path_for_cache = ""
 
         def handle_mcp_request(request: dict) -> dict:
-            """处理来自服务器的 MCP 请求"""
+            """处理来自服务器的 MCP 请求。
+
+            先拦截缓存类工具 (find_regex / entity_query / list_funcs /
+            list_globals / imports / refresh_cache / cache_status)，
+            直接用本地 SQLite 响应，不进入 ida_mcp 正常分发，不占 IDA 主线程。
+            """
+            from typing import cast as _cast
+            if TYPE_CHECKING:
+                from .broker import cache_handlers as _cache_handlers
+                from .broker.cache_types import JsonRpcRequest as _JsonRpcRequest
+            else:
+                from broker import cache_handlers as _cache_handlers
+                from broker.cache_types import JsonRpcRequest as _JsonRpcRequest
+
+            typed_req = _cast(_JsonRpcRequest, request)
+            if _cache_handlers.is_cache_tool(typed_req):
+                idb_for_cache = self._idb_path_for_cache or _get_current_idb_path()
+                return dict(_cache_handlers.handle_cache_tool_locally(typed_req, idb_for_cache))
+
             out = MCP_SERVER.registry.dispatch(request)
             if out is None:
                 return {
@@ -153,7 +199,7 @@ class MCP(idaapi.plugin_t):
                     "error": {"code": -32603, "message": "Internal error"},
                     "id": request.get("id"),
                 }
-            return out
+            return dict(out)
 
         if not silent:
             print("[MCP] 正在连接到 MCP 服务器...")
@@ -208,6 +254,19 @@ class MCP(idaapi.plugin_t):
             self._connected = False
         except Exception:
             pass
+
+        # 顺带停止该 IDB 对应的 SQLite 缓存守护线程
+        target = getattr(self, "_idb_path_for_cache", "") or ""
+        if target:
+            try:
+                if TYPE_CHECKING:
+                    from .broker import sqlite_cache as _mcp_sqlite_cache
+                else:
+                    from broker import sqlite_cache as _mcp_sqlite_cache
+                _mcp_sqlite_cache.stop_cache_daemon(target)
+            except Exception:
+                pass
+        self._idb_path_for_cache = ""
 
     def term(self):
         self._disconnect()
