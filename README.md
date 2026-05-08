@@ -220,7 +220,6 @@ uv run ida-pro-mcp --broker --port 13337
 | `--broker` | 仅启动 Broker（HTTP，不启动 stdio） |
 | `--broker-url URL` | 当前 MCP 进程要连的 Broker 地址，默认 `http://127.0.0.1:13337` |
 | `--port PORT` | Broker 监听端口，默认 13337 |
-| `--transport URL` | 以 SSE 方式直接挂载到上游 MCP 传输，如 `http://127.0.0.1:8744/sse` |
 | `--config` | 打印当前 MCP 配置 |
 
 Broker 地址也可由环境变量指定：
@@ -345,17 +344,45 @@ IDA_MCP_BROKER_URL=http://127.0.0.1:13337 ida-pro-mcp
 
 ## 十二、SSE 传输与无头 idalib
 
-直接以 SSE 方式对外提供服务：
+本增强版的 `ida-pro-mcp` 主入口默认通过 stdio 连接 MCP 客户端，通过 Broker 与 IDA 插件通信；Broker 独占 HTTP 端口。
 
-```bash
-uv run ida-pro-mcp --transport http://127.0.0.1:8744/sse
-```
-
-无头（需安装 [`idalib`](https://docs.hex-rays.com/user-guide/idalib)）：
+无头模式由 `idalib-mcp` 提供（需安装 [`idalib`](https://docs.hex-rays.com/user-guide/idalib)）。可以启动时指定一个二进制：
 
 ```bash
 uv run idalib-mcp --host 127.0.0.1 --port 8745 path/to/executable
-# 严格的每连接上下文隔离
+```
+
+也可以不带初始文件启动，之后用 `idalib_open(...)` / `idalib_close(...)` 动态打开和关闭数据库：
+
+```bash
+uv run idalib-mcp --host 127.0.0.1 --port 8745
+```
+
+stdio 客户端可使用：
+
+```bash
+uv run idalib-mcp --stdio
+```
+
+`idalib-mcp` 是一个 supervisor：每个打开的数据库由独立 idalib worker 进程承载。若请求的 IDB 已经在运行插件的 GUI IDA 中打开，`idalib-mcp` 会优先路由到该 GUI 实例；GUI 实例消失后，下次请求会在可行时回退到无头 worker。需要让回退看到 GUI 中的改动时，请先保存 IDB。
+
+工具可通过当前 MCP 上下文绑定的数据库执行，也可以显式传 `database` 参数指定 session ID、文件名或输入路径：
+
+```bash
+uv run idalib-mcp --stdio --max-workers 4
+```
+
+```python
+idalib_open("/path/to/binary_a.exe", session_id="binary_a")
+idalib_open("/path/to/library.dll", session_id="library")
+
+decompile("main", database="binary_a")
+xrefs_to("ImportantExport", database="library")
+```
+
+需要严格的每传输上下文隔离时启用 `--isolated-contexts`：
+
+```bash
 uv run idalib-mcp --isolated-contexts --host 127.0.0.1 --port 8745 path/to/executable
 ```
 
@@ -363,7 +390,7 @@ uv run idalib-mcp --isolated-contexts --host 127.0.0.1 --port 8745 path/to/execu
 
 - 每个传输上下文（`/mcp` 的 `Mcp-Session-Id`、`/sse` 的 `session`、stdio 的 `stdio:default`）都有自己独立的 session 绑定。
 - 未绑定上下文调用 IDB 依赖工具会直接失败，避免跨 Agent 误操作。
-- 多 Agent 想共享同一 session 时，通过 `idalib_switch(session_id)` 主动加入即可。
+- 多 Agent 想共享同一 session 时，可以传 `database=...` 或通过 `idalib_switch(session_id)` 主动加入。
 
 上下文管理工具：
 
@@ -371,7 +398,12 @@ uv run idalib-mcp --isolated-contexts --host 127.0.0.1 --port 8745 path/to/execu
 - `idalib_switch(session_id)` 切换绑定
 - `idalib_current()` 查当前绑定
 - `idalib_unbind()` 解绑
-- `idalib_list()` 列表，带 `is_active / is_current_context / bound_contexts`
+- `idalib_list()` 列表，带 `is_active / is_current_context / bound_contexts / backend / pid`
+
+worker 控制：
+
+- `--max-workers N`：最大同时打开的数据库 worker 数（`0` 表示无限制，默认 `4`）
+- `IDA_MCP_MAX_WORKERS`：`--max-workers` 的环境变量默认值
 
 ---
 

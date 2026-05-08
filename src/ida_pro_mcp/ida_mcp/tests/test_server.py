@@ -1,7 +1,7 @@
-"""Tests for the top-level stdio proxy server (server.py) and unsafe tool gating."""
+"""Tests for the top-level Broker-mode stdio server and unsafe tool gating."""
 
-import argparse
 import contextlib
+import copy
 import os
 import sys
 
@@ -10,153 +10,163 @@ from ..rpc import MCP_SERVER, MCP_UNSAFE
 
 try:
     from ida_pro_mcp import server
+    from ida_pro_mcp.broker import manager as broker_manager
 except ImportError:
     _parent = os.path.join(os.path.dirname(__file__), "..", "..")
     sys.path.insert(0, _parent)
     try:
         import server  # type: ignore
+        from broker import manager as broker_manager  # type: ignore
     finally:
         sys.path.remove(_parent)
 
 
-class _FakeHttpResponse:
-    status = 200
-    reason = "OK"
+class _FakeBrokerClient:
+    def __init__(self, *, instances=None, response=None):
+        self.instances = instances if instances is not None else []
+        self.response = response
+        self.sent = []
+        self.list_calls = 0
 
-    def __init__(self, body=b'{"jsonrpc":"2.0","result":{}}'):
-        self._body = body
+    def list_instances(self):
+        self.list_calls += 1
+        return list(self.instances)
 
-    def read(self):
-        return self._body
+    def has_instances(self):
+        return bool(self.instances)
 
-
-class _RecordingConnection:
-    calls = []
-
-    def __init__(self, host, port, timeout=None):
-        self.host = host
-        self.port = port
-        self.timeout = timeout
-
-    def request(self, method, path, body=None, headers=None):
-        self.__class__.calls.append(
-            {
-                "host": self.host,
-                "port": self.port,
-                "timeout": self.timeout,
-                "method": method,
-                "path": path,
-                "body": body,
-                "headers": headers or {},
-            }
-        )
-
-    def getresponse(self):
-        return _FakeHttpResponse()
-
-    def close(self):
-        pass
+    def send_request(self, request, instance_id=None, timeout=60.0):
+        self.sent.append((copy.deepcopy(request), instance_id, timeout))
+        return self.response
 
 
 @contextlib.contextmanager
-def _saved_target():
-    """Preserve the currently selected IDA target across assertions."""
-    old_host = server.IDA_HOST
-    old_port = server.IDA_PORT
-    old_session = getattr(server.mcp._transport_session_id, "data", None)
-    old_exts = getattr(server.mcp._enabled_extensions, "data", set())
+def _patched_broker(fake):
+    old = broker_manager._broker_client
+    broker_manager._broker_client = fake
     try:
-        yield
+        yield fake
     finally:
-        server.IDA_HOST = old_host
-        server.IDA_PORT = old_port
-        server.mcp._transport_session_id.data = old_session
-        server.mcp._enabled_extensions.data = old_exts
+        broker_manager._broker_client = old
+
+
+def _dispatch(request):
+    return server.mcp.registry.dispatch(request)
 
 
 @test()
-def test_tools_list_keeps_discovery_and_launch_tools_when_ida_unreachable():
-    """tools/list should still expose local discovery/recovery tools when IDA is down."""
-    with _saved_target():
-        server.IDA_HOST = "127.0.0.1"
-        server.IDA_PORT = 1  # unreachable
-        req = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
-        result = server.dispatch_proxy(req)
-        assert "result" in result, f"Expected successful tools/list response, got: {result}"
-        tool_names = {tool["name"] for tool in result["result"].get("tools", [])}
-        assert "select_instance" in tool_names
-        assert "list_instances" in tool_names
-        assert "open_file" in tool_names
+def test_tools_call_without_instances_returns_broker_error():
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "refresh_cache", "arguments": {"instance_id": "ida-1"}},
+    }
+    with _patched_broker(_FakeBrokerClient()) as fake:
+        response = _dispatch(request)
+    assert response["error"]["code"] == -32000
+    assert "没有活动的 IDA 实例" in response["error"]["message"]
+    assert fake.sent == []
 
 
 @test()
-def test_server_proxy_to_instance_forwards_session_and_extensions():
-    """Top-level proxy requests should preserve MCP session and enabled extensions."""
-    with _saved_target():
-        original_conn = server.http.client.HTTPConnection
-        _RecordingConnection.calls = []
-        server.http.client.HTTPConnection = _RecordingConnection
-        server.mcp._transport_session_id.data = "http:session-456"
-        server.mcp._enabled_extensions.data = {"dbg"}
-        try:
-            server._proxy_to_instance("127.0.0.1", 13337, b"{}")
-            assert len(_RecordingConnection.calls) == 1
-            call = _RecordingConnection.calls[0]
-            assert call["path"] == "/mcp?ext=dbg"
-            assert call["headers"].get("Mcp-Session-Id") == "session-456"
-        finally:
-            server.http.client.HTTPConnection = original_conn
+def test_tools_call_requires_instance_id():
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "cache_status", "arguments": {}},
+    }
+    fake = _FakeBrokerClient(instances=[{"instance_id": "ida-1"}])
+    with _patched_broker(fake):
+        response = _dispatch(request)
+    assert response["error"]["code"] == -32602
+    assert "必须提供 instance_id" in response["error"]["message"]
+    assert fake.sent == []
 
 
 @test()
-def test_resolve_ida_rpc_preserves_ext_query_param():
-    """--ida-rpc http://host:port/mcp?ext=dbg should seed enabled extensions."""
-    with _saved_target():
-        args = argparse.Namespace(ida_rpc="http://10.0.0.1:9999/mcp?ext=dbg")
-        server._resolve_ida_rpc(args)
-        assert server.IDA_HOST == "10.0.0.1"
-        assert server.IDA_PORT == 9999
-        exts = getattr(server.mcp._enabled_extensions, "data", set())
-        assert "dbg" in exts, f"Expected 'dbg' in enabled extensions, got: {exts}"
+def test_tools_call_routes_once_and_strips_instance_id():
+    upstream = {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "refresh_cache",
+            "arguments": {"instance_id": "ida-1", "force": True},
+        },
+    }
+    fake = _FakeBrokerClient(instances=[{"instance_id": "ida-1"}], response=upstream)
+    with _patched_broker(fake):
+        response = _dispatch(request)
+    assert response == upstream
+    assert len(fake.sent) == 1
+    forwarded, instance_id, timeout = fake.sent[0]
+    assert instance_id == "ida-1"
+    assert timeout == 60.0
+    assert forwarded["params"]["arguments"] == {"force": True}
 
 
 @test()
-def test_resolve_ida_rpc_preserves_multiple_ext_query_params():
-    """--ida-rpc with ext=dbg,extra should seed both extensions."""
-    with _saved_target():
-        args = argparse.Namespace(ida_rpc="http://10.0.0.1:9999/mcp?ext=dbg,extra")
-        server._resolve_ida_rpc(args)
-        exts = getattr(server.mcp._enabled_extensions, "data", set())
-        assert "dbg" in exts, f"Expected 'dbg' in extensions, got: {exts}"
-        assert "extra" in exts, f"Expected 'extra' in extensions, got: {exts}"
+def test_tools_call_timeout_is_not_retried():
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "cache_status", "arguments": {"instance_id": "ida-1"}},
+    }
+    fake = _FakeBrokerClient(instances=[{"instance_id": "ida-1"}], response=None)
+    with _patched_broker(fake):
+        response = _dispatch(request)
+    assert response["error"]["code"] == -32000
+    assert "IDA 请求超时" in response["error"]["message"]
+    assert len(fake.sent) == 1
 
 
 @test()
-def test_resolve_ida_rpc_no_ext_leaves_extensions_empty():
-    """--ida-rpc without ext param should not add spurious extensions."""
-    with _saved_target():
-        server.mcp._enabled_extensions.data = set()
-        args = argparse.Namespace(ida_rpc="http://10.0.0.1:9999")
-        server._resolve_ida_rpc(args)
-        exts = getattr(server.mcp._enabled_extensions, "data", set())
-        assert len(exts) == 0, f"Expected no extensions, got: {exts}"
+def test_tools_list_keeps_broker_tools_when_ida_unreachable():
+    request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    fake = _FakeBrokerClient()
+    with _patched_broker(fake):
+        response = _dispatch(request)
+    assert "result" in response, f"Expected successful tools/list response, got: {response}"
+    tool_names = {tool["name"] for tool in response["result"].get("tools", [])}
+    assert "instance_list" in tool_names
+    assert "instance_info" in tool_names
+    assert "refresh_cache" in tool_names
+    assert "cache_status" in tool_names
 
 
 @test()
-def test_ida_rpc_ext_flows_through_to_proxy_path():
-    """Extensions from --ida-rpc should appear in proxied request path."""
-    with _saved_target():
-        original_conn = server.http.client.HTTPConnection
-        _RecordingConnection.calls = []
-        server.http.client.HTTPConnection = _RecordingConnection
-        try:
-            args = argparse.Namespace(ida_rpc="http://10.0.0.1:9999/mcp?ext=dbg")
-            server._resolve_ida_rpc(args)
-            server._proxy_to_instance("10.0.0.1", 9999, b"{}")
-            assert len(_RecordingConnection.calls) == 1
-            assert _RecordingConnection.calls[0]["path"] == "/mcp?ext=dbg"
-        finally:
-            server.http.client.HTTPConnection = original_conn
+def test_resources_read_without_instances_returns_empty_contents():
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "resources/read",
+        "params": {"uri": "ida://cursor"},
+    }
+    with _patched_broker(_FakeBrokerClient()) as fake:
+        response = _dispatch(request)
+    assert response["result"] == {"contents": []}
+    assert fake.sent == []
+
+
+@test()
+def test_resources_read_with_instance_routes_through_broker():
+    upstream = {"jsonrpc": "2.0", "id": 1, "result": {"contents": []}}
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "resources/read",
+        "params": {"uri": "ida://cursor"},
+    }
+    fake = _FakeBrokerClient(instances=[{"instance_id": "ida-1"}], response=upstream)
+    with _patched_broker(fake):
+        response = _dispatch(request)
+    assert response == upstream
+    assert len(fake.sent) == 1
+    assert fake.sent[0][1] is None
 
 
 # ---------------------------------------------------------------------------

@@ -7,14 +7,12 @@ This lets a single MCP endpoint reach any running IDA instance.
 
 import http.client
 import json
-import os
-import subprocess
-import sys
 import threading
-import time
+from collections import OrderedDict
 from typing import Annotated, NotRequired, TypedDict
 
 from .rpc import tool, MCP_SERVER
+from .zeromcp import EXTERNAL_BASE_HEADER, get_current_request_external_base_url
 from .discovery import discover_instances, probe_instance
 
 
@@ -37,17 +35,6 @@ class InstanceListItem(TypedDict, total=False):
     active: bool
 
 
-class OpenFileResult(TypedDict, total=False):
-    success: bool
-    host: str
-    port: int
-    binary: str
-    pid: int
-    switched: bool
-    message: str
-    error: str
-
-
 # Track which instance this server is (filled in by the plugin loader)
 _LOCAL_PORT: int | None = None
 _LOCAL_HOST: str = "127.0.0.1"
@@ -62,7 +49,7 @@ _redirect_targets: dict[str, tuple[str, int]] = {}
 _redirect_lock = threading.Lock()
 
 # Tools that are always handled locally, never proxied
-_LOCAL_TOOL_NAMES = {"list_instances", "select_instance", "open_file"}
+_LOCAL_TOOL_NAMES = {"list_instances", "select_instance"}
 
 
 def set_local_instance(host: str, port: int):
@@ -128,6 +115,46 @@ def is_local_tool(name: str) -> bool:
 
 
 PROXY_HEADER = "X-MCP-Proxied"
+OUTPUT_PROXY_CACHE_MAX_SIZE = 100
+_output_proxy_targets: OrderedDict[str, tuple[str, int]] = OrderedDict()
+_output_proxy_lock = threading.Lock()
+
+
+def _extract_output_id(response: dict) -> str | None:
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return None
+    meta = result.get("_meta")
+    if not isinstance(meta, dict):
+        return None
+    ida_meta = meta.get("ida_mcp")
+    if not isinstance(ida_meta, dict):
+        return None
+    output_id = ida_meta.get("output_id")
+    return output_id if isinstance(output_id, str) else None
+
+
+def _remember_output_proxy_target(output_id: str, host: str, port: int) -> None:
+    with _output_proxy_lock:
+        _output_proxy_targets.pop(output_id, None)
+        _output_proxy_targets[output_id] = (host, port)
+        while len(_output_proxy_targets) > OUTPUT_PROXY_CACHE_MAX_SIZE:
+            _output_proxy_targets.popitem(last=False)
+
+
+def get_output_proxy_target(output_id: str) -> tuple[str, int] | None:
+    with _output_proxy_lock:
+        target = _output_proxy_targets.get(output_id)
+        if target is None:
+            return None
+        _output_proxy_targets.move_to_end(output_id)
+        return target
+
+
+def _remember_output_proxy_target_from_response(host: str, port: int, response: dict) -> None:
+    output_id = _extract_output_id(response)
+    if output_id:
+        _remember_output_proxy_target(output_id, host, port)
 
 
 def _get_proxy_request_path() -> str:
@@ -149,6 +176,9 @@ def _get_proxy_request_headers() -> dict[str, str]:
         session_id = transport_session_id.split(":", 1)[1]
         if session_id and session_id != "anonymous":
             headers["Mcp-Session-Id"] = session_id
+    external_base_url = get_current_request_external_base_url()
+    if external_base_url:
+        headers[EXTERNAL_BASE_HEADER] = external_base_url
     return headers
 
 
@@ -170,7 +200,22 @@ def proxy_to_instance(host: str, port: int, payload: bytes) -> dict:
         raw_data = response.read().decode()
         if response.status >= 400:
             raise RuntimeError(f"HTTP {response.status} {response.reason}: {raw_data}")
-        return json.loads(raw_data)
+        parsed = json.loads(raw_data)
+        _remember_output_proxy_target_from_response(host, port, parsed)
+        return parsed
+    finally:
+        conn.close()
+
+
+def proxy_output_to_instance(
+    host: str, port: int, path: str
+) -> tuple[int, str, list[tuple[str, str]], bytes]:
+    """Forward an output download request to another IDA instance."""
+    conn = http.client.HTTPConnection(host, port, timeout=30)
+    try:
+        conn.request("GET", path, headers={PROXY_HEADER: "1"})
+        response = conn.getresponse()
+        return response.status, response.reason, response.getheaders(), response.read()
     finally:
         conn.close()
 
@@ -330,119 +375,3 @@ def select_instance(
 
     _set_redirect_target(host, port)
     return {"success": True, "host": host, "port": port}
-
-
-def _find_existing_idb(file_path: str) -> str | None:
-    """Check if an IDB already exists for the given binary.
-
-    IDA creates .idb (32-bit) or .i64 (64-bit) files next to the binary.
-    Opening the IDB directly skips the packed/unpacked dialog.
-    """
-    base = os.path.splitext(file_path)[0]
-    # Prefer .i64 (64-bit) over .idb (32-bit)
-    for ext in (".i64", ".idb"):
-        idb_path = base + ext
-        if os.path.isfile(idb_path):
-            return idb_path
-    return None
-
-
-@tool
-def open_file(
-    file_path: Annotated[
-        str, "Absolute path to the binary file to open in a new IDA instance"
-    ],
-    switch: Annotated[
-        bool, "Automatically switch to the new instance once it starts"
-    ] = True,
-    autonomous: Annotated[
-        bool, "Run in autonomous mode (-A flag), suppressing all dialogs"
-    ] = False,
-    new_database: Annotated[
-        bool, "Force creating a new database even if one exists"
-    ] = False,
-    timeout: Annotated[
-        int, "Seconds to wait for the new instance to register (0 = don't wait)"
-    ] = 30,
-) -> OpenFileResult:
-    """Open a file in a new IDA Pro instance.
-
-    Launches a new IDA process for the given binary. If an existing IDB/i64 database
-    is found, opens that directly (skips the packed/unpacked dialog). Use new_database=True
-    to force a fresh analysis. Use autonomous=True to suppress all IDA dialogs.
-
-    If switch=True (default), automatically routes subsequent tool calls to the new instance.
-    """
-    if not os.path.isfile(file_path):
-        return {"success": False, "error": f"File not found: {file_path}"}
-
-    # Get the IDA executable from the currently running instance
-    ida_exe = sys.executable
-    if not os.path.isfile(ida_exe):
-        return {"success": False, "error": f"Cannot find IDA executable: {ida_exe}"}
-
-    # Determine what to open: existing IDB or raw binary
-    target = file_path
-    if not new_database:
-        existing_idb = _find_existing_idb(file_path)
-        if existing_idb:
-            target = existing_idb
-
-    args = [ida_exe]
-    if autonomous:
-        args.append("-A")
-    if new_database:
-        args.append("-c")  # Force new database
-    args.append(target)
-
-    # Snapshot current instances before launch
-    before = {(i["host"], i["port"]) for i in discover_instances()}
-
-    try:
-        subprocess.Popen(
-            args,
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-            if sys.platform == "win32" else 0,
-        )
-    except Exception as e:
-        return {"success": False, "error": f"Failed to launch IDA: {e}"}
-
-    if timeout == 0:
-        return {"success": True, "message": "IDA launched, not waiting for registration"}
-
-    # Poll for the new instance to register
-    deadline = time.monotonic() + timeout
-    new_instance = None
-    while time.monotonic() < deadline:
-        time.sleep(1)
-        current = discover_instances()
-        for inst in current:
-            key = (inst["host"], inst["port"])
-            if key not in before:
-                new_instance = inst
-                break
-        if new_instance:
-            break
-
-    if not new_instance:
-        return {
-            "success": True,
-            "message": (
-                f"IDA launched but did not register within {timeout}s. "
-                "Use list_instances to check later."
-            ),
-        }
-
-    result = {
-        "success": True,
-        "host": new_instance["host"],
-        "port": new_instance["port"],
-        "binary": new_instance["binary"],
-        "pid": new_instance["pid"],
-    }
-
-    if switch:
-        _set_redirect_target(new_instance["host"], new_instance["port"])
-        result["switched"] = True
-
-    return result

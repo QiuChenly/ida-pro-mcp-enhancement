@@ -2,7 +2,7 @@
 
 This module provides comprehensive debugging functionality including:
 - Debugger control (start, exit, continue, step, run_to)
-- Breakpoint management (add, delete, enable/disable, list)
+- Breakpoint management (add, delete, enable/disable, conditions, list)
 - Register inspection (all registers, GP registers, specific registers)
 - Memory operations (read/write debugger memory)
 - Call stack inspection
@@ -11,19 +11,22 @@ This module provides comprehensive debugging functionality including:
 import os
 from typing import Annotated, NotRequired, TypedDict
 
+import idc
 import ida_dbg
 import ida_entry
 import ida_idd
 import ida_idaapi
+import ida_kernwin
 import ida_name
 import idaapi
 
 from .rpc import tool, unsafe, ext
-from .sync import idasync, IDAError
+from .sync import idasync, keep_batch, get_pre_call_batch, IDAError
 from .utils import (
     RegisterValue,
     ThreadRegisters,
     Breakpoint,
+    BreakpointConditionOp,
     BreakpointOp,
     MemoryRead,
     MemoryPatch,
@@ -35,13 +38,20 @@ from .utils import (
 
 class DebugControlResult(TypedDict, total=False):
     ip: str
+    started: bool
+    continued: bool
+    running: bool
+    suspended: bool
     exited: bool
+    state: str
     error: str
 
 
 class BreakpointResult(TypedDict, total=False):
     addr: str
     ok: bool
+    condition: str | None
+    language: str | None
     error: str
 
 
@@ -105,12 +115,51 @@ GENERAL_PURPOSE_REGISTERS = {
 }
 
 
-def dbg_ensure_running() -> "ida_idd.debugger_t":
+def _get_process_state_name() -> str:
+    if not ida_dbg.is_debugger_on():
+        return "not_running"
+
+    state = ida_dbg.get_process_state()
+    if state == ida_dbg.DSTATE_SUSP:
+        return "suspended"
+    if state == ida_dbg.DSTATE_RUN:
+        return "running"
+    if state == ida_dbg.DSTATE_NOTASK:
+        return "not_running"
+    return f"unknown({state})"
+
+
+def _get_debug_state_result() -> DebugControlResult:
+    state = _get_process_state_name()
+    result: DebugControlResult = {"state": state}
+    if state == "running":
+        result["running"] = True
+    elif state == "suspended":
+        result["suspended"] = True
+        ip = ida_dbg.get_ip_val()
+        if ip is not None:
+            result["ip"] = hex(ip)
+    return result
+
+
+def dbg_ensure_active() -> "ida_idd.debugger_t":
     dbg = ida_idd.get_dbg()
-    if not dbg:
-        raise IDAError("Debugger not running")
-    if ida_dbg.get_ip_val() is None:
-        raise IDAError("Debugger not running")
+    if not dbg or not ida_dbg.is_debugger_on():
+        raise IDAError(
+            "Debugger not running. Stop and ask the user to start a debugger "
+            "session (call dbg_start, or have them launch from IDA) before "
+            "retrying. If dbg_start has already been attempted and failed, "
+            "the user must first configure the debugger and target."
+        )
+    return dbg
+
+
+def dbg_ensure_suspended() -> "ida_idd.debugger_t":
+    dbg = dbg_ensure_active()
+    if ida_dbg.get_process_state() != ida_dbg.DSTATE_SUSP:
+        raise IDAError(
+            "Debugger is running; wait until it suspends before inspecting state"
+        )
     return dbg
 
 
@@ -175,6 +224,42 @@ def _get_registers_specific_for_thread(
     )
 
 
+def _normalize_breakpoint_language(language: object) -> str | None:
+    if language is None:
+        return None
+    text = str(language).strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered == "idc":
+        return "IDC"
+    if lowered == "python":
+        return "Python"
+    return text
+
+
+def _get_breakpoint_language(bpt: ida_dbg.bpt_t) -> str | None:
+    language = getattr(bpt, "elang", None)
+    if language is None:
+        return None
+    text = str(language).strip()
+    return text or None
+
+
+def _set_breakpoint_language(bpt: ida_dbg.bpt_t, language: str) -> None:
+    setter = getattr(bpt, "set_cnd_elang", None)
+    if callable(setter):
+        if not setter(language):
+            raise IDAError(f"Failed to set breakpoint condition language to {language}")
+        return
+    try:
+        setattr(bpt, "elang", language)
+    except Exception as exc:
+        raise IDAError(
+            f"Failed to set breakpoint condition language to {language}"
+        ) from exc
+
+
 def list_breakpoints() -> list[Breakpoint]:
     breakpoints: list[Breakpoint] = []
     for i in range(ida_dbg.get_bpt_qty()):
@@ -183,8 +268,9 @@ def list_breakpoints() -> list[Breakpoint]:
             breakpoints.append(
                 Breakpoint(
                     addr=hex(bpt.ea),
-                    enabled=bpt.flags & ida_dbg.BPT_ENABLED,
+                    enabled=bool(bpt.flags & ida_dbg.BPT_ENABLED),
                     condition=str(bpt.condition) if bpt.condition else None,
+                    language=_get_breakpoint_language(bpt),
                 )
             )
     return breakpoints
@@ -195,12 +281,105 @@ def list_breakpoints() -> list[Breakpoint]:
 # ============================================================================
 
 
+def _get_debug_start_result() -> DebugControlResult | None:
+    if not ida_dbg.is_debugger_on():
+        return None
+    result = _get_debug_state_result()
+    result["started"] = True
+    return result
+
+
+# Batch-mode lifecycle for dbg_start.
+#
+# start_process schedules work that runs on the IDA main thread *after* our
+# execute_sync returns. That work can show modal dialogs (e.g. "matching
+# executable names"), so we need batch mode to remain on across the
+# execute_sync boundary, and we need to be sure to turn it back off once the
+# debugger has actually come up (or failed to). _DbgStartBatchHook does both.
+_DBG_START_BATCH_FALLBACK_MS = 30_000  # absolute ceiling on stuck-in-batch state
+_DBG_START_WAIT_TIMEOUT_SEC = 10.0
+_DBG_START_WAIT_POLL_MS = 100
+_DBG_START_IP_GRACE_POLL_COUNT = 5
+
+
+class _DbgStartBatchHook(ida_dbg.DBG_Hooks):
+    """Restore batch mode as soon as the debugger has finished STARTUP.
+
+    "Startup" ends at dbg_process_start / dbg_process_attach — by then any
+    startup dialogs (e.g. "matching executable names") are done, but the
+    user is still inside an active debug session and should see normal
+    dialogs from here on. dbg_process_exit / dbg_process_detach also
+    restore so we don't get stuck if the process dies before fully coming
+    up.
+    """
+
+    def __init__(self, restore_batch: int):
+        super().__init__()
+        self._restore_batch = restore_batch
+        self._done = False
+
+    def dbg_process_start(self, pid, tid, ea, name, base, size):
+        self._restore()
+
+    def dbg_process_attach(self, pid, tid, ea, name, base, size):
+        self._restore()
+
+    def dbg_process_exit(self, pid, tid, ea, exit_code):
+        self._restore()
+
+    def dbg_process_detach(self, pid, tid, ea):
+        self._restore()
+
+    def fallback_restore(self):
+        """Called by the safety timer if no debugger event ever arrives."""
+        self._restore()
+
+    def _restore(self):
+        if self._done:
+            return
+        self._done = True
+        try:
+            self.unhook()
+        except Exception:
+            pass
+        idc.batch(self._restore_batch)
+
+
+_dbg_start_batch_hook: _DbgStartBatchHook | None = None
+
+
+def _arm_dbg_start_batch_hook(restore_batch: int) -> None:
+    """Install the batch-restore hook before start_process is invoked."""
+    global _dbg_start_batch_hook
+    if _dbg_start_batch_hook is not None:
+        _dbg_start_batch_hook.fallback_restore()
+    hook = _DbgStartBatchHook(restore_batch)
+    hook.hook()
+    _dbg_start_batch_hook = hook
+
+    def _fallback():
+        if _dbg_start_batch_hook is hook and not hook._done:
+            hook.fallback_restore()
+        return -1  # don't repeat
+
+    ida_kernwin.register_timer(_DBG_START_BATCH_FALLBACK_MS, _fallback)
+
+
 @ext("dbg")
 @unsafe
 @tool
 @idasync
+@keep_batch
 def dbg_start() -> DebugControlResult:
-    """Start debugger session for current target."""
+    """Start debugger session for current target.
+
+    Requires the user to have selected a debugger (Debugger -> Select debugger)
+    and configured the target (executable path, arguments, attach process,
+    remote host, etc.). If this call fails, do not retry repeatedly. Stop,
+    explain to the user that debugging is not yet configured, and ask them
+    to set up the debugger and dismiss any IDA dialogs (e.g. "matching
+    executable names") before trying again.
+    """
     if len(list_breakpoints()) == 0:
         for i in range(ida_entry.get_entry_qty()):
             ordinal = ida_entry.get_entry_ordinal(i)
@@ -208,11 +387,76 @@ def dbg_start() -> DebugControlResult:
             if addr != ida_idaapi.BADADDR:
                 ida_dbg.add_bpt(addr, 0, idaapi.BPT_SOFT)
 
-    if idaapi.start_process("", "", "") == 1:
-        ip = ida_dbg.get_ip_val()
-        if ip is not None:
-            return {"ip": hex(ip)}
-    raise IDAError("Failed to start debugger")
+    # Arm a DBG_Hooks instance to switch IDA back to its pre-call batch
+    # state once the debugger has actually started. Combined with
+    # @keep_batch on this function, batch mode stays on across the
+    # execute_sync boundary so dialogs the debugger plugin shows during
+    # initialization (e.g. "matching executable names") are auto-handled.
+    # The hook restores on dbg_process_start / _attach / _exit / _detach,
+    # with a register_timer fallback so we never get stuck in batch mode.
+    # Capture the pre-call batch (what the caller had set before the
+    # sync wrapper bumped it to 1) so headless / batch-mode workflows
+    # aren't silently flipped to interactive after dbg_start.
+    pre_call_batch = get_pre_call_batch()
+    if pre_call_batch is None:
+        pre_call_batch = 0
+    _arm_dbg_start_batch_hook(restore_batch=pre_call_batch)
+
+    # start_process is documented as asynchronous; when invoked from the
+    # IDA main thread inside execute_sync the return code is unreliable
+    # (often -1 even on success, because the dbg_process_start event has
+    # not yet been dispatched). Trust the actual debugger state instead,
+    # and only consult the return code as a tiebreaker for the error
+    # message when nothing ever comes up.
+    start_result = idaapi.start_process("", "", "")
+
+    started = _get_debug_start_result()
+    if started is not None:
+        if started.get("running") and "ip" not in started:
+            for _ in range(_DBG_START_IP_GRACE_POLL_COUNT):
+                ida_dbg.wait_for_next_event(
+                    ida_dbg.WFNE_ANY | ida_dbg.WFNE_SUSP | ida_dbg.WFNE_SILENT,
+                    _DBG_START_WAIT_POLL_MS,
+                )
+                waited = _get_debug_start_result()
+                if waited is None:
+                    continue
+                started = waited
+                if started.get("suspended") or "ip" in started:
+                    break
+        return started
+
+    for _ in range(int(_DBG_START_WAIT_TIMEOUT_SEC * 1000 / _DBG_START_WAIT_POLL_MS)):
+        ida_dbg.wait_for_next_event(
+            ida_dbg.WFNE_ANY | ida_dbg.WFNE_SUSP | ida_dbg.WFNE_SILENT,
+            _DBG_START_WAIT_POLL_MS,
+        )
+        started = _get_debug_start_result()
+        if started is not None:
+            return started
+
+    if start_result == 0:
+        raise IDAError(
+            "Debugger start was cancelled. Stop and ask the user to configure "
+            "the debugger (Debugger -> Select debugger, set the target path / "
+            "arguments) and dismiss any IDA dialogs before retrying."
+        )
+    raise IDAError(
+        "Failed to start debugger. Stop and ask the user to verify that a "
+        "debugger is selected (Debugger -> Select debugger), the target is "
+        "configured (executable path / arguments / remote host), and any "
+        "pending IDA dialogs (e.g. \"matching executable names\") have been "
+        "dismissed before retrying."
+    )
+
+
+@ext("dbg")
+@unsafe
+@tool
+@idasync
+def dbg_status() -> DebugControlResult:
+    """Return debugger lifecycle state and current IP if suspended."""
+    return _get_debug_state_result()
 
 
 @ext("dbg")
@@ -221,9 +465,9 @@ def dbg_start() -> DebugControlResult:
 @idasync
 def dbg_exit() -> DebugControlResult:
     """Terminate active debugger session."""
-    dbg_ensure_running()
+    dbg_ensure_active()
     if idaapi.exit_process():
-        return {"exited": True}
+        return {"exited": True, "state": "not_running"}
     raise IDAError("Failed to exit debugger")
 
 
@@ -233,11 +477,11 @@ def dbg_exit() -> DebugControlResult:
 @idasync
 def dbg_continue() -> DebugControlResult:
     """Resume execution in active debugger session."""
-    dbg_ensure_running()
+    dbg_ensure_suspended()
     if idaapi.continue_process():
-        ip = ida_dbg.get_ip_val()
-        if ip is not None:
-            return {"ip": hex(ip)}
+        result = _get_debug_state_result()
+        result["continued"] = True
+        return result
     raise IDAError("Failed to continue debugger")
 
 
@@ -249,12 +493,12 @@ def dbg_run_to(
     addr: Annotated[str, "Target execution address (hex or decimal)"],
 ) -> DebugControlResult:
     """Run debuggee until target address is reached."""
-    dbg_ensure_running()
+    dbg_ensure_suspended()
     ea = parse_address(addr)
     if idaapi.run_to(ea):
-        ip = ida_dbg.get_ip_val()
-        if ip is not None:
-            return {"ip": hex(ip)}
+        result = _get_debug_state_result()
+        result["continued"] = True
+        return result
     raise IDAError(f"Failed to run to address {hex(ea)}")
 
 
@@ -264,11 +508,11 @@ def dbg_run_to(
 @idasync
 def dbg_step_into() -> DebugControlResult:
     """Execute one instruction, stepping into calls."""
-    dbg_ensure_running()
+    dbg_ensure_suspended()
     if idaapi.step_into():
-        ip = ida_dbg.get_ip_val()
-        if ip is not None:
-            return {"ip": hex(ip)}
+        result = _get_debug_state_result()
+        result["continued"] = True
+        return result
     raise IDAError("Failed to step into")
 
 
@@ -278,11 +522,11 @@ def dbg_step_into() -> DebugControlResult:
 @idasync
 def dbg_step_over() -> DebugControlResult:
     """Execute one instruction, stepping over calls."""
-    dbg_ensure_running()
+    dbg_ensure_suspended()
     if idaapi.step_over():
-        ip = ida_dbg.get_ip_val()
-        if ip is not None:
-            return {"ip": hex(ip)}
+        result = _get_debug_state_result()
+        result["continued"] = True
+        return result
     raise IDAError("Failed to step over")
 
 
@@ -296,7 +540,7 @@ def dbg_step_over() -> DebugControlResult:
 @tool
 @idasync
 def dbg_bps() -> list[Breakpoint]:
-    """List breakpoints with address and enabled status."""
+    """List breakpoints with address, enabled status, condition, and language."""
     return list_breakpoints()
 
 
@@ -387,6 +631,104 @@ def dbg_toggle_bp(
     return results
 
 
+@ext("dbg")
+@unsafe
+@tool
+@idasync
+def dbg_set_bp_condition(
+    items: list[BreakpointConditionOp] | BreakpointConditionOp,
+) -> list[BreakpointResult]:
+    """Set or clear breakpoint conditions in batch."""
+
+    items = normalize_dict_list(items)
+
+    results = []
+    for item in items:
+        addr = item.get("addr", "")
+        condition = item.get("condition")
+        language = _normalize_breakpoint_language(item.get("language"))
+        low_level = bool(item.get("low_level", False))
+
+        try:
+            ea = parse_address(addr)
+            bpt = ida_dbg.bpt_t()
+            if not ida_dbg.get_bpt(ea, bpt):
+                results.append({"addr": addr, "error": "Breakpoint not found"})
+                continue
+
+            condition_text = "" if condition is None else str(condition)
+            current_language = _get_breakpoint_language(bpt)
+            current_condition = str(bpt.condition) if bpt.condition else None
+
+            if language is not None and language != current_language:
+                if current_condition and condition_text:
+                    if not idc.set_bpt_cond(ea, "", 1 if low_level else 0):
+                        results.append(
+                            {
+                                "addr": addr,
+                                "error": "Failed to clear existing breakpoint condition before changing its language",
+                            }
+                        )
+                        continue
+                    if not ida_dbg.get_bpt(ea, bpt):
+                        results.append(
+                            {
+                                "addr": addr,
+                                "error": "Breakpoint condition was cleared, but breakpoint could not be reloaded to update its language",
+                            }
+                        )
+                        continue
+
+                _set_breakpoint_language(bpt, language)
+                if not ida_dbg.update_bpt(bpt):
+                    results.append(
+                        {
+                            "addr": addr,
+                            "error": f"Failed to apply breakpoint condition language {language}",
+                        }
+                    )
+                    continue
+
+            if not idc.set_bpt_cond(ea, condition_text, 1 if low_level else 0):
+                results.append({"addr": addr, "error": "Failed to set breakpoint condition"})
+                continue
+
+            updated = ida_dbg.bpt_t()
+            if not ida_dbg.get_bpt(ea, updated):
+                results.append(
+                    {
+                        "addr": addr,
+                        "error": "Breakpoint condition was set, but breakpoint could not be reloaded for validation",
+                    }
+                )
+                continue
+
+            updated_condition = str(updated.condition) if updated.condition else None
+            updated_language = _get_breakpoint_language(updated)
+            is_compiled = getattr(updated, "is_compiled", None)
+            if condition_text and callable(is_compiled) and not is_compiled():
+                results.append(
+                    {
+                        "addr": addr,
+                        "error": "Breakpoint condition was stored but did not compile successfully",
+                    }
+                )
+                continue
+
+            results.append(
+                {
+                    "addr": addr,
+                    "ok": True,
+                    "condition": updated_condition,
+                    "language": updated_language,
+                }
+            )
+        except Exception as e:
+            results.append({"addr": addr, "error": str(e)})
+
+    return results
+
+
 # ============================================================================
 # Register Operations
 # ============================================================================
@@ -399,7 +741,7 @@ def dbg_toggle_bp(
 def dbg_regs_all() -> list[ThreadRegisters]:
     """Return full register sets for all debugger threads."""
     result: list[ThreadRegisters] = []
-    dbg = dbg_ensure_running()
+    dbg = dbg_ensure_suspended()
     for thread_index in range(ida_dbg.get_thread_qty()):
         tid = ida_dbg.getn_thread(thread_index)
         result.append(_get_registers_for_thread(dbg, tid))
@@ -417,7 +759,7 @@ def dbg_regs_remote(
     if isinstance(tids, int):
         tids = [tids]
 
-    dbg = dbg_ensure_running()
+    dbg = dbg_ensure_suspended()
     available_tids = [ida_dbg.getn_thread(i) for i in range(ida_dbg.get_thread_qty())]
     results = []
 
@@ -442,7 +784,7 @@ def dbg_regs_remote(
 @idasync
 def dbg_regs() -> ThreadRegisters:
     """Return full registers for current debugger thread."""
-    dbg = dbg_ensure_running()
+    dbg = dbg_ensure_suspended()
     tid = ida_dbg.get_current_thread()
     return _get_registers_for_thread(dbg, tid)
 
@@ -458,7 +800,7 @@ def dbg_gpregs_remote(
     if isinstance(tids, int):
         tids = [tids]
 
-    dbg = dbg_ensure_running()
+    dbg = dbg_ensure_suspended()
     available_tids = [ida_dbg.getn_thread(i) for i in range(ida_dbg.get_thread_qty())]
     results = []
 
@@ -483,7 +825,7 @@ def dbg_gpregs_remote(
 @idasync
 def dbg_gpregs() -> ThreadRegisters:
     """Get current thread GP registers"""
-    dbg = dbg_ensure_running()
+    dbg = dbg_ensure_suspended()
     tid = ida_dbg.get_current_thread()
     return _get_registers_general_for_thread(dbg, tid)
 
@@ -499,7 +841,7 @@ def dbg_regs_named_remote(
     ],
 ) -> ThreadRegisters:
     """Return selected registers for a specific thread ID."""
-    dbg = dbg_ensure_running()
+    dbg = dbg_ensure_suspended()
     if thread_id not in [
         ida_dbg.getn_thread(i) for i in range(ida_dbg.get_thread_qty())
     ]:
@@ -518,7 +860,7 @@ def dbg_regs_named(
     ],
 ) -> ThreadRegisters:
     """Get specific current thread registers"""
-    dbg = dbg_ensure_running()
+    dbg = dbg_ensure_suspended()
     tid = ida_dbg.get_current_thread()
     names = [name.strip() for name in register_names.split(",")]
     return _get_registers_specific_for_thread(dbg, tid, names)
@@ -591,7 +933,7 @@ def dbg_read(
     """Read debuggee memory from one or more regions."""
 
     regions = normalize_dict_list(regions)
-    dbg_ensure_running()
+    dbg_ensure_active()
     results = []
 
     for region in regions:
@@ -637,7 +979,7 @@ def dbg_write(
     """Write bytes to debuggee memory regions."""
 
     regions = normalize_dict_list(regions)
-    dbg_ensure_running()
+    dbg_ensure_active()
     results = []
 
     for region in regions:

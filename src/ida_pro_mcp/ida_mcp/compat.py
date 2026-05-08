@@ -36,14 +36,23 @@ def _parse_kernel_version(v: str) -> tuple[int, int, int]:
     return (major, minor, patch)
 
 
-def _check_required_apis() -> None:
+def _check_required_apis(version: tuple[int, int, int]) -> None:
     """
     Check that required Python APIs are available.
 
     IDA 9.0 initial release (build 240925) is missing several Python API methods
     that were added in 8.5 and later reinstated in 9.0 SP1 (build 241217).
     Rather than adding compatibility hacks, we explicitly reject this version.
+
+    Older IDA versions (<8.5) legitimately lack these methods; the wrappers in
+    this module (get_func_name, get_func_prototype, tinfo_get_udm) provide
+    fallbacks, so we only enforce the check on IDA 9.0+.
     """
+    # Only IDA 9.0+ is expected to have these methods natively. Pre-8.5 versions
+    # are handled via fallback wrappers in this module.
+    if version < (9, 0, 0):
+        return
+
     missing = []
 
     # Check func_t methods (added in 8.5, missing in 9.0 SP0)
@@ -59,9 +68,9 @@ def _check_required_apis() -> None:
         missing.append("tinfo_t.get_udm")
 
     if missing:
-        version = idaapi.get_kernel_version()
+        ver_str = idaapi.get_kernel_version()
         raise RuntimeError(
-            f"IDA Pro {version} is missing required Python API methods: "
+            f"IDA Pro {ver_str} is missing required Python API methods: "
             f"{', '.join(missing)}. "
             f"If using IDA 9.0, please upgrade to IDA 9.0 SP1 or later."
         )
@@ -75,7 +84,7 @@ if TYPE_CHECKING:
     IDA_VERSION: tuple[int, int, int] = cast(tuple[int, int, int], (9, 2, 0))
 else:
     IDA_VERSION = _parse_kernel_version(idaapi.get_kernel_version())
-    _check_required_apis()
+    _check_required_apis(IDA_VERSION)
 
 IDA_GE_90 = IDA_VERSION >= (9, 0, 0)
 IDA_GE_85 = IDA_VERSION >= (8, 5, 0)
@@ -98,29 +107,50 @@ if not IDA_GE_84:
 # Entry point compatibility
 # ============================================================================
 
+# Entry-point APIs have moved between modules across IDA versions:
+#   - IDA 9.0+:    ida_entry.*
+#   - IDA 8.4-8.x: ida_entry.* (also still in ida_nalt in some builds)
+#   - IDA <8.4:    idaapi.* / ida_nalt.* depending on build
+# Resolve them once at import time by probing the candidate modules.
+
+
+def _resolve_entry_api(name: str) -> Callable:
+    candidates = []
+    if IDA_GE_84:
+        # ida_entry was imported above when IDA_GE_84
+        candidates.append(ida_entry)
+    candidates.append(ida_nalt)
+    candidates.append(idaapi)
+    for mod in candidates:
+        fn = getattr(mod, name, None)
+        if fn is not None:
+            return fn
+    raise AttributeError(
+        f"IDA Pro {idaapi.get_kernel_version()} does not expose '{name}' "
+        f"in ida_entry, ida_nalt, or idaapi"
+    )
+
+
+_get_entry_qty = _resolve_entry_api("get_entry_qty")
+_get_entry_ordinal = _resolve_entry_api("get_entry_ordinal")
+_get_entry = _resolve_entry_api("get_entry")
+_get_entry_name = _resolve_entry_api("get_entry_name")
+
 
 def get_entry_qty() -> int:
-    if IDA_GE_90:
-        return ida_entry.get_entry_qty()
-    return ida_nalt.get_entry_qty()
+    return _get_entry_qty()
 
 
 def get_entry_ordinal(idx: int) -> int:
-    if IDA_GE_90:
-        return ida_entry.get_entry_ordinal(idx)
-    return ida_nalt.get_entry_ordinal(idx)
+    return _get_entry_ordinal(idx)
 
 
 def get_entry(ordinal: int) -> int:
-    if IDA_GE_90:
-        return ida_entry.get_entry(ordinal)
-    return ida_nalt.get_entry(ordinal)
+    return _get_entry(ordinal)
 
 
 def get_entry_name(ordinal: int) -> str | None:
-    if IDA_GE_90:
-        return ida_entry.get_entry_name(ordinal)
-    return ida_nalt.get_entry_name(ordinal)
+    return _get_entry_name(ordinal)
 
 
 # ============================================================================
@@ -183,15 +213,17 @@ def inf_is_64bit() -> bool:
 
 
 def get_func_name(func: ida_funcs.func_t) -> str | None:
-    # func_t.get_name() introduced in 8.5
-    if IDA_GE_85:
+    # func_t.get_name() introduced in 8.5, but missing in early 9.0 builds (build 240925)
+    # Use hasattr() to handle early IDA 9.0 builds that lack the method
+    if IDA_GE_85 and hasattr(func, "get_name"):
         return func.get_name()
     return ida_funcs.get_func_name(func.start_ea)
 
 
 def get_func_prototype(func: ida_funcs.func_t) -> ida_typeinf.tinfo_t | None:
-    # func_t.get_prototype() introduced in 8.5
-    if IDA_GE_85:
+    # func_t.get_prototype() introduced in 8.5, but missing in early 9.0 builds (build 240925)
+    # Use hasattr() to handle early IDA 9.0 builds that lack the method
+    if IDA_GE_85 and hasattr(func, "get_prototype"):
         return func.get_prototype()
 
     tif = ida_typeinf.tinfo_t()
@@ -281,3 +313,39 @@ def guess_tinfo(tif: ida_typeinf.tinfo_t, ea: int) -> bool:
             pass
 
     return False
+
+
+# ============================================================================
+# UDM (struct/union member) compatibility
+# ============================================================================
+
+
+def tinfo_get_udm(
+    tif: ida_typeinf.tinfo_t, name: str
+) -> tuple[int, ida_typeinf.udm_t | None]:
+    """
+    Get a UDM (user-defined member) from a tinfo_t by name.
+
+    tinfo_t.get_udm() was introduced in IDA 8.5 but is missing in early
+    IDA 9.0 builds (build 240925). This wrapper provides a fallback using
+    the older find_udm() + get_udm_by_tid() APIs.
+
+    Returns:
+        tuple of (index, udm) where udm is None if not found
+    """
+    # Try modern API first (available in 8.5+ but not early 9.0 builds)
+    if hasattr(tif, "get_udm"):
+        return tif.get_udm(name)
+
+    # Fallback for early 9.0 builds using find_udm + get_udm_by_tid
+    idx = tif.find_udm(name)
+    if idx == -1:
+        return -1, None
+
+    udm = ida_typeinf.udm_t()
+    tid = tif.get_udm_tid(idx)
+    # get_udm_by_tid returns 0 on success (C convention), check if udm.name is populated
+    tif.get_udm_by_tid(udm, tid)
+    if udm.name:
+        return idx, udm
+    return -1, None

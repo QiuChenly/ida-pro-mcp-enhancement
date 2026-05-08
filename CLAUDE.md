@@ -18,6 +18,7 @@ Important API modules:
 - `api_types.py`: structs, type inference, type application
 - `api_modify.py`: comments, renaming, asm patching
 - `api_stack.py`: stack frame operations
+- `api_sigmaker.py`: signature creation, scanning, xref signatures (uses sigmaker.py)
 - `api_debug.py`: debugger control, unsafe / low priority for tests
 - `api_python.py`: execute Python in IDA context
 - `api_resources.py`: `ida://` MCP resources
@@ -72,6 +73,7 @@ def dangerous_op(...):
 ```bash
 uv run ida-pro-mcp
 uv run ida-pro-mcp --transport http://127.0.0.1:8744/sse
+uv run idalib-mcp --stdio path/to/binary
 uv run idalib-mcp --host 127.0.0.1 --port 8745 path/to/binary
 uv run idalib-mcp --isolated-contexts --host 127.0.0.1 --port 8745 path/to/binary
 uv run ida-pro-mcp --unsafe
