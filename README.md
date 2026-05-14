@@ -197,6 +197,30 @@ uv run ida-pro-mcp --broker --port 13337
 # 3. 打开 IDA、加载二进制，按 Ctrl+Alt+M 连接到 Broker
 ```
 
+### 远程访问
+
+当 MCP 客户端（Cursor / Claude）运行在**另一台机器**上时，`--broker` 直接绑定 `0.0.0.0`，一个端口同时处理 IDA 插件和远程 MCP 客户端：
+
+```bash
+uv run ida-pro-mcp --broker --port 13337
+```
+
+在远程机器的 MCP 客户端配置中：
+
+```json
+{
+  "mcpServers": {
+    "ida-pro-mcp": {
+      "url": "http://<IDA机器的IP>:13337/mcp"
+    }
+  }
+}
+```
+
+IDB 打开后，在 IDA 中按 Ctrl+Alt+M，连接地址填 `http://<机器IP>:13337`。
+
+> **安全提示**：远程模式下 CORS 会自动放宽为 `*`。建议仅在可信网络中暴露端口，或配合 VPN/SSH 隧道使用。
+
 ### 多实例模式
 
 同时分析多个二进制：打开多个 IDA，分别按 Ctrl+Alt+M 连上 Broker。
@@ -217,7 +241,7 @@ uv run ida-pro-mcp --broker --port 13337
 | `--install` | 安装 IDA 插件 + 各 MCP 客户端配置 |
 | `--uninstall` | 卸载 IDA 插件 + 各 MCP 客户端配置 |
 | `--unsafe` | 启用调试器等不安全工具（`dbg_*`） |
-| `--broker` | 仅启动 Broker（HTTP，不启动 stdio） |
+| `--broker` | 启动 Broker HTTP 服务器（0.0.0.0），同时提供 MCP 协议端点和 IDA 注册端点 |
 | `--broker-url URL` | 当前 MCP 进程要连的 Broker 地址，默认 `http://127.0.0.1:13337` |
 | `--port PORT` | Broker 监听端口，默认 13337 |
 | `--config` | 打印当前 MCP 配置 |
@@ -344,7 +368,16 @@ IDA_MCP_BROKER_URL=http://127.0.0.1:13337 ida-pro-mcp
 
 ## 十二、SSE 传输与无头 idalib
 
-本增强版的 `ida-pro-mcp` 主入口默认通过 stdio 连接 MCP 客户端，通过 Broker 与 IDA 插件通信；Broker 独占 HTTP 端口。
+本增强版的 `ida-pro-mcp` 主入口默认通过 stdio 连接 MCP 客户端，Broker 模式 (`--broker`) 则直接提供 HTTP 端点（默认 `0.0.0.0:13337`），单端口承载全部功能：
+
+```bash
+uv run ida-pro-mcp --broker
+```
+
+该端口同时提供：
+- `/mcp` — Streamable HTTP（MCP 客户端连接）
+- `/sse` — MCP SSE 传输
+- `/register`, `/events` 等 — IDA 插件注册与 SSE 通道
 
 无头模式由 `idalib-mcp` 提供（需安装 [`idalib`](https://docs.hex-rays.com/user-guide/idalib)）。可以启动时指定一个二进制：
 

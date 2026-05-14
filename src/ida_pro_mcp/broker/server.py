@@ -403,13 +403,13 @@ class IDAHttpServer:
             return
 
         try:
-            self._server = ThreadedHTTPServer(("127.0.0.1", self.port), IDARequestHandler)
+            self._server = ThreadedHTTPServer(("0.0.0.0", self.port), IDARequestHandler)
             self._server.timeout = 1
             self._running = True
             self._thread = threading.Thread(target=self._serve, daemon=True)
             self._thread.start()
 
-            print(f"[HTTP] 服务器已启动 (多线程): http://127.0.0.1:{self.port}", file=sys.stderr)
+            print(f"[HTTP] 服务器已启动 (多线程): http://0.0.0.0:{self.port}", file=sys.stderr)
             sys.stderr.flush()
         except OSError as e:
             if e.errno == 48:  # Address already in use
@@ -426,7 +426,7 @@ class IDAHttpServer:
             except Exception:
                 if self._running:
                     pass
-    
+
     def stop(self):
         """停止服务器"""
         self._running = False
@@ -436,7 +436,7 @@ class IDAHttpServer:
             except Exception:
                 pass
             self._server = None
-    
+
     @property
     def registry(self) -> IDARegistry:
         """获取注册表"""

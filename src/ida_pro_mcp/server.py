@@ -1,10 +1,8 @@
 """IDA Pro MCP Server
 
-Broker architecture:
-  - Broker mode (--broker): start the HTTP broker that owns the IDA registry.
-  - MCP mode (default): run stdio and forward requests through the broker.
-
-  Cursor --stdio--> server.py --HTTP--> Broker <--HTTP+SSE-- IDA Plugin
+  --broker: 单端口 HTTP 服务器 (0.0.0.0)，同时提供 MCP 端点和 IDA 注册端点
+            远程 Cursor --HTTP--> Broker <--HTTP+SSE-- IDA Plugin
+  default:  本地 stdio 模式，通过 HTTP 转发到 Broker
 """
 
 import argparse
@@ -22,7 +20,6 @@ if __name__ == "__main__" or __package__ is None:
     from ida_pro_mcp.broker.manager import (
         get_broker_client,
         register_broker_tools,
-        run_broker,
         setup_dispatch_proxy,
     )
     from ida_pro_mcp.install import (
@@ -39,7 +36,6 @@ else:
     from .broker.manager import (
         get_broker_client,
         register_broker_tools,
-        run_broker,
         setup_dispatch_proxy,
     )
     from .install import install_ida_plugin, install_mcp_servers, print_mcp_config
@@ -169,7 +165,7 @@ def main():
     parser.add_argument(
         "--broker",
         action="store_true",
-        help="仅启动 Broker（HTTP），不启动 stdio；多窗口/多 IDA 时请先单独运行",
+        help="启动 Broker HTTP 服务器（0.0.0.0），同时提供 MCP 和 IDA 注册端点；省略则使用 stdio",
     )
     parser.add_argument(
         "--broker-url",
@@ -197,7 +193,12 @@ def main():
         return
 
     if args.broker:
-        run_broker(args.port)
+        from .broker.combined import CombinedRequestHandler
+
+        get_broker_client(f"http://127.0.0.1:{args.port}")
+        mcp.cors_allowed_origins = ["*"]
+        print(f"[MCP] Broker 已启动: http://0.0.0.0:{args.port}/mcp", file=sys.stderr)
+        mcp.serve("0.0.0.0", args.port, background=False, request_handler=CombinedRequestHandler)
         return
 
     get_broker_client(args.broker_url)
